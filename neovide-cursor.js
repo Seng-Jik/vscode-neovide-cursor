@@ -3,11 +3,11 @@ const cursorColor = "#C8D3F5"; // cursor color
 const cursorUpdatePollingRate = 500; // dom detecting time (ms)
 const useShadow = true; // cursor shadow
 const shadowColor = cursorColor; // cursor shadow color
-const shadowBlur = 10; // shadow blur radius
+const shadowBlur = 15; // shadow blur radius
 
 const ANIMATION_SETTINGS = {
-  animationLength: 0.10, // animation time length (when cursor jumping)
-  shortAnimationLength: 0.04, // short animation time length (when cursor moving on single line)
+  animationLength: 0.20, // animation time length (when cursor jumping)
+  shortAnimationLength: 0.06, // short animation time length (when cursor moving on single line)
   trailSize: 1, // animation trail density (0-1)
 };
 
