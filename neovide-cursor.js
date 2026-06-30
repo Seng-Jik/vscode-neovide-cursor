@@ -7,7 +7,7 @@ const shadowBlur = 20; // shadow blur radius
 
 const ANIMATION_SETTINGS = {
   animationLength: 0.15, // animation time length (when cursor jumping)
-  shortAnimationLength: 0.04, // short animation time length (when cursor moving on single line)
+  shortAnimationLength: 0.06, // short animation time length (when cursor moving on single line)
   trailSize: 1, // animation trail density (0-1)
 };
 
