@@ -399,7 +399,13 @@ class GlobalCursorManager {
   loop() {
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 
-    for (const [, data] of this.cursors) {
+    for (const [id, data] of this.cursors) {
+      // DOM 节点被移除的光标（例如退出多光标模式时销毁的次光标）立即清理，
+      // 避免在下一次轮询到来前继续读取失效节点的位置，导致光标飞向左上角。
+      if (!data.target.isConnected) {
+        this.cursors.delete(id);
+        continue;
+      }
       this.updateCursor(data);
     }
 
