@@ -315,6 +315,10 @@ class GlobalCursorManager {
     this.ctx = this.canvas.getContext("2d");
     this.isScrolling = false;
     this.scrollTimeout = null;
+    // 单调递增的创建序号，用于在同一窗格里定位"最近一次创建的光标"。不能靠
+    // Map 的插入序，因为 scanCursors 是按 DOM 文档顺序遍历，新增的光标若位于
+    // 文档更靠前的位置，会被排到已有光标前面，与真实创建顺序不符。
+    this.creationCounter = 0;
     this.init();
   }
 
@@ -342,6 +346,33 @@ class GlobalCursorManager {
     this.loop();
 
     setInterval(() => this.scanCursors(), cursorUpdatePollingRate);
+
+    // 通过 MutationObserver 立即响应 .cursor 节点的增删，消除 Ctrl+D 等操作
+    // 到动画启动之间的轮询延迟。轮询保留作为兜底，避免观察范围之外遗漏。
+    this.pendingScan = false;
+    const observer = new MutationObserver((mutations) => {
+      if (this.pendingScan) return;
+      for (const m of mutations) {
+        if (this.mutationHasCursor(m.addedNodes) || this.mutationHasCursor(m.removedNodes)) {
+          this.pendingScan = true;
+          requestAnimationFrame(() => {
+            this.pendingScan = false;
+            this.scanCursors();
+          });
+          return;
+        }
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  mutationHasCursor(nodeList) {
+    for (const node of nodeList) {
+      if (node.nodeType !== 1) continue;
+      if (node.classList && node.classList.contains("cursor")) return true;
+      if (node.querySelector && node.querySelector(".monaco-editor .cursor")) return true;
+    }
+    return false;
   }
 
   updateCanvasSize() {
@@ -352,6 +383,19 @@ class GlobalCursorManager {
   scanCursors() {
     const nowIds = new Set();
     const cursorElements = document.querySelectorAll(".monaco-editor .cursor");
+
+    // 按所在的 .monaco-editor 容器（窗格）分组已有光标，让新光标的动画起点
+    // 只在同一窗格内查找——避免从另一个分屏的光标飞过来。每组内按 createdAt
+    // 排序，取最大值即"实际最近一次创建的那个"（不能用 Map 插入序，因为它
+    // 反映的是 DOM 文档顺序）。
+    const editorGroups = new Map();
+    for (const data of this.cursors.values()) {
+      if (!data.target.isConnected) continue;
+      const editor = data.target.closest(".monaco-editor");
+      if (!editor) continue;
+      if (!editorGroups.has(editor)) editorGroups.set(editor, []);
+      editorGroups.get(editor).push(data);
+    }
 
     cursorElements.forEach((target) => {
       let cursorId = target.getAttribute("custom-cursor-id");
@@ -365,13 +409,37 @@ class GlobalCursorManager {
         const instance = createNeovideCursor({ canvas: this.canvas });
         const rect = target.getBoundingClientRect();
         instance.updateCursorSize(rect.width, rect.height);
-        instance.setPosition(rect.left, rect.top);
+
+        // 只在同一 .monaco-editor 窗格内查找起点光标，按 createdAt 取最近
+        // 一次创建的那个。使用 lastX/lastY 而不是实时 getBoundingClientRect：
+        // 在 MutationObserver 触发的时刻，Monaco 可能正处于批量 DOM 更新中
+        // （例如 Ctrl+Shift+L），此时旧光标的 rect 可能瞬时归零或被移到别处，
+        // 而 lastX/lastY 反映的是"最近一次渲染循环里稳定看到的位置"，也就是
+        // 眼睛看到的起点，视觉最自然。
+        const editor = target.closest(".monaco-editor");
+        const siblings = editor ? editorGroups.get(editor) : null;
+        let spawnSource = null;
+        if (siblings && siblings.length > 0) {
+          let last = siblings[0];
+          for (let i = 1; i < siblings.length; i++) {
+            if (siblings[i].createdAt > last.createdAt) last = siblings[i];
+          }
+          spawnSource = { x: last.lastX, y: last.lastY };
+        }
+
+        if (spawnSource) {
+          instance.setPosition(spawnSource.x, spawnSource.y);
+          instance.move(rect.left, rect.top);
+        } else {
+          instance.setPosition(rect.left, rect.top);
+        }
 
         this.cursors.set(cursorId, {
           instance,
           target: target,
           lastX: rect.left,
-          lastY: rect.top
+          lastY: rect.top,
+          createdAt: ++this.creationCounter
         });
       }
     });
