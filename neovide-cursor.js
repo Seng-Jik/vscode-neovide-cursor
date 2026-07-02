@@ -280,7 +280,7 @@ function createNeovideCursor(options) {
   }
 
   function updateLoopLogic(isScrolling, shouldDraw) {
-    if (!initialized) return;
+    if (!initialized) return false;
     const now = performance.now();
     const dt = Math.min((now - lastTimestamp) / 1000, 1 / 30);
     lastTimestamp = now;
@@ -294,8 +294,11 @@ function createNeovideCursor(options) {
       });
     }
 
+    let animating = false;
     corners.forEach(corner => {
-      corner.update(cursorDimensions, centerDestination, dt, immediateMovement);
+      if (corner.update(cursorDimensions, centerDestination, dt, immediateMovement)) {
+        animating = true;
+      }
     });
 
     if (shouldDraw) {
@@ -303,6 +306,7 @@ function createNeovideCursor(options) {
     }
 
     jumped = false;
+    return animating;
   }
 
   return { move, updateCursorSize, setPosition, updateLoopLogic };
@@ -383,6 +387,7 @@ class GlobalCursorManager {
     // （第一次聚焦）直接更新当前窗格，不放动画。
     if (this.lastActiveCursorPos) {
       for (const data of this.cursors.values()) {
+        if (data.dying) continue;
         if (!data.target.isConnected) continue;
         if (data.target.closest(".monaco-editor") !== editor) continue;
         const rect = data.target.getBoundingClientRect();
@@ -403,6 +408,7 @@ class GlobalCursorManager {
   pickEditorAnchor(editor) {
     let best = null;
     for (const data of this.cursors.values()) {
+      if (data.dying) continue;
       if (!data.target.isConnected) continue;
       if (data.target.closest(".monaco-editor") !== editor) continue;
       if (!best || data.createdAt > best.createdAt) best = data;
@@ -435,6 +441,7 @@ class GlobalCursorManager {
     // 反映的是 DOM 文档顺序）。
     const editorGroups = new Map();
     for (const data of this.cursors.values()) {
+      if (data.dying) continue;
       if (!data.target.isConnected) continue;
       const editor = data.target.closest(".monaco-editor");
       if (!editor) continue;
@@ -472,6 +479,16 @@ class GlobalCursorManager {
           spawnSource = { x: last.lastX, y: last.lastY };
         }
 
+        // 同窗格找不到兄弟光标时（例如新分屏里首次出现的光标，或者 DOM 刚插入
+        // 时兄弟光标的 rect 尚未稳定），退回到"当前活跃窗格的主光标位置"作为
+        // 动画起点，避免退化成从画布左上角 (0,0) 起飞的怪异动画。
+        if (!spawnSource) {
+          const activeEditor = document.querySelector(".monaco-editor.focused");
+          if (activeEditor) {
+            spawnSource = this.pickEditorAnchor(activeEditor);
+          }
+        }
+
         if (spawnSource) {
           instance.setPosition(spawnSource.x, spawnSource.y);
           instance.move(rect.left, rect.top);
@@ -482,28 +499,93 @@ class GlobalCursorManager {
         this.cursors.set(cursorId, {
           instance,
           target: target,
+          // 缓存所在窗格：DOM 被销毁后 target.closest 会返回 null，吸回动画找
+          // 不到主光标；提前缓存后哪怕 target 断链也能定位到窗格。
+          editor: target.closest(".monaco-editor"),
           lastX: rect.left,
           lastY: rect.top,
-          createdAt: ++this.creationCounter
+          createdAt: ++this.creationCounter,
+          dying: false
         });
       }
     });
 
-    for (const [id, _] of this.cursors) {
-      if (!nowIds.has(id)) {
+    for (const [id, data] of this.cursors) {
+      if (nowIds.has(id)) continue;
+      if (data.dying) continue;
+      // DOM 被移除的光标（例如 Esc 退出多光标模式时销毁的次光标）不立刻删除，
+      // 而是标记为 dying 并给它设置一个"吸回主光标"的目的地，让 spring 动画
+      // 把它拉过去，产生被吸附的视觉效果。找不到吸附目标（例如整个窗格都消
+      // 失）时直接删除。
+      const suckTarget = this.findSuckTarget(data);
+      if (!suckTarget) {
         this.cursors.delete(id);
+        continue;
       }
+      this.startDying(data, suckTarget);
     }
+  }
+
+  // 把一个光标从活跃状态切换到 dying：设置吸附目的地并记录淡出起始时间。
+  // 之所以抽出来是因为 scanCursors 和 loop 两个路径都会触发销毁。
+  startDying(data, suckTarget) {
+    data.dying = true;
+    data.dyingAt = performance.now();
+    // 淡出时长与吸附动画对齐：动画结束时透明度正好为 0，视觉上没有"到达终点
+    // 再突然消失"的跳变。乘以 1000 换成毫秒；下限 60ms 防止极短动画下淡出
+    // 过快看起来像闪断。
+    data.fadeDuration = Math.max(ANIMATION_SETTINGS.animationLength * 1000, 60);
+    data.instance.move(suckTarget.x, suckTarget.y);
+  }
+
+  // 在同一窗格内挑一个"还活着"的最近使用的光标作为吸附目标。多光标模式退出
+  // 时，主光标通常还留着，这里就会命中主光标；若整窗格都被销毁则返回 null。
+  findSuckTarget(dyingData) {
+    let best = null;
+    for (const data of this.cursors.values()) {
+      if (data === dyingData) continue;
+      if (data.dying) continue;
+      if (!data.target.isConnected) continue;
+      if (data.editor !== dyingData.editor) continue;
+      if (!best || data.createdAt > best.createdAt) best = data;
+    }
+    if (!best) return null;
+    return { x: best.lastX, y: best.lastY };
   }
 
   loop() {
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 
     for (const [id, data] of this.cursors) {
-      // DOM 节点被移除的光标（例如退出多光标模式时销毁的次光标）立即清理，
-      // 避免在下一次轮询到来前继续读取失效节点的位置，导致光标飞向左上角。
+      if (data.dying) {
+        // dying 光标不再读 DOM（target 可能已经断链），只让 spring 动画跑完，
+        // 到达吸附点后再真正从 Map 里删掉。淡出用 globalAlpha 统一削弱本体和
+        // 阴影，避免多个光标叠加时产生大面积光晕。
+        const elapsed = performance.now() - data.dyingAt;
+        const alpha = Math.max(0, 1 - elapsed / data.fadeDuration);
+        if (alpha <= 0) {
+          this.cursors.delete(id);
+          continue;
+        }
+        this.ctx.save();
+        this.ctx.globalAlpha = alpha;
+        const animating = this.runWithEditorClip(data.editor, () =>
+          data.instance.updateLoopLogic(this.isScrolling, true)
+        );
+        this.ctx.restore();
+        if (!animating) this.cursors.delete(id);
+        continue;
+      }
+      // DOM 节点被移除但还未走到 scanCursors 的兜底路径（例如 loop 早于下一次
+      // scan 触发）：这里不再直接 delete，先启动吸回动画，找不到吸附目标时才
+      // 真正丢弃。
       if (!data.target.isConnected) {
-        this.cursors.delete(id);
+        const suckTarget = this.findSuckTarget(data);
+        if (suckTarget) {
+          this.startDying(data, suckTarget);
+        } else {
+          this.cursors.delete(id);
+        }
         continue;
       }
       this.updateCursor(data);
@@ -546,7 +628,29 @@ class GlobalCursorManager {
       data.lastY = rect.top;
     }
 
-    instance.updateLoopLogic(this.isScrolling, !isOffScreen);
+    // 把绘制限制在光标所属窗格的矩形范围内：光标动画尾巴或跨窗格切换的过渡
+    // 期间，可能会算出窗格之外的位置，如果直接画到共享的全屏 canvas 上，就
+    // 会盖在相邻窗格的内容之上；用 clip 让越界像素直接被丢掉。
+    this.runWithEditorClip(editor, () =>
+      instance.updateLoopLogic(this.isScrolling, !isOffScreen)
+    );
+  }
+
+  // 用光标所属窗格的矩形对 canvas 做临时裁剪，回调里的所有绘制都不会溢出。
+  // editor 为 null（例如 dying 光标缓存的窗格已被销毁）时不裁剪，直接执行。
+  runWithEditorClip(editor, fn) {
+    if (!editor || !editor.isConnected) return fn();
+    const bounds = editor.getBoundingClientRect();
+    if (bounds.width === 0 && bounds.height === 0) return fn();
+    this.ctx.save();
+    this.ctx.beginPath();
+    this.ctx.rect(bounds.left, bounds.top, bounds.width, bounds.height);
+    this.ctx.clip();
+    try {
+      return fn();
+    } finally {
+      this.ctx.restore();
+    }
   }
 }
 
