@@ -10,6 +10,11 @@ const ANIMATION_SETTINGS = {
   trailSize: 1, // animation trail density (0-1)
 };
 
+// 光标离目标的距离超过这个像素数即视为"飞行中"，允许穿越其他窗格；小于等于
+// 时视为已到位，启用 clip 防止阴影从边缘溢出到邻居窗格。取大于 shadowBlur
+// 是为了在阴影半径够小时不误判为飞行。
+const CLIP_DISTANCE_THRESHOLD = 30;
+
 // -----------------------
 
 const STANDARD_CORNERS = [
@@ -615,7 +620,10 @@ class GlobalCursorManager {
         data.instance.setShadowAlphaFactor(shadowAlpha);
         this.ctx.save();
         this.ctx.globalAlpha = bodyAlpha;
-        const animating = this.runWithEditorClip(data.editor, () =>
+        // 飞行中允许穿越其他窗格（否则动画会被邻居窗格"咬"断一截）；接近
+        // 目标进入停留态时再启用 clip，避免阴影从边缘溢出到别的窗格。
+        const flying = dist > CLIP_DISTANCE_THRESHOLD;
+        const animating = this.runWithEditorClip(data.editor, flying, () =>
           data.instance.updateLoopLogic(this.isScrolling, true)
         );
         this.ctx.restore();
@@ -674,24 +682,35 @@ class GlobalCursorManager {
       data.lastY = rect.top;
     }
 
-    // 把绘制限制在光标所属窗格的矩形范围内：光标动画尾巴或跨窗格切换的过渡
-    // 期间，可能会算出窗格之外的位置，如果直接画到共享的全屏 canvas 上，就
-    // 会盖在相邻窗格的内容之上；用 clip 让越界像素直接被丢掉。
-    this.runWithEditorClip(editor, () =>
+    // 稳态下把绘制限制在光标所属窗格外的允许区，防止阴影从窗格边缘溢出到
+    // 邻居窗格的内容里；飞行途中（跨窗格切换的动画中段）临时放开 clip，让
+    // 光标可以穿越其他窗格，否则动画会被邻居窗格咬掉一段看起来断开了。
+    const flying = instance.getDistanceToDestination() > CLIP_DISTANCE_THRESHOLD;
+    this.runWithEditorClip(editor, flying, () =>
       instance.updateLoopLogic(this.isScrolling, !isOffScreen)
     );
   }
 
-  // 用光标所属窗格的矩形对 canvas 做临时裁剪，回调里的所有绘制都不会溢出。
-  // editor 为 null（例如 dying 光标缓存的窗格已被销毁）时不裁剪，直接执行。
-  runWithEditorClip(editor, fn) {
-    if (!editor || !editor.isConnected) return fn();
-    const bounds = editor.getBoundingClientRect();
-    if (bounds.width === 0 && bounds.height === 0) return fn();
+  // 允许 dying / 跨窗格切换过程中的光标穿越 tab bar 和窗格之间的间隙，但不
+  // 允许盖到其他窗格的内容区。做法：clip 掉"所有其他 .monaco-editor 的矩形"，
+  // 保留整块画布的剩余部分——即当前 editor 本身、标题栏、编辑器之间的空隙。
+  // 用 evenodd 填充规则实现"外框减去内框"的环形 clip。飞行途中（flying=true）
+  // 完全跳过 clip，让光标穿越任何东西——因为路径中段本来就跨在多个窗格上。
+  runWithEditorClip(editor, flying, fn) {
+    if (flying) return fn();
     this.ctx.save();
     this.ctx.beginPath();
-    this.ctx.rect(bounds.left, bounds.top, bounds.width, bounds.height);
-    this.ctx.clip();
+    // 外框：整块 canvas。所有绘制默认落在这里。
+    this.ctx.rect(0, 0, this.canvas.width, this.canvas.height);
+    // 内框：每个"其他窗格"。evenodd 会把这些矩形从允许区里挖掉。
+    const editors = document.querySelectorAll(".monaco-editor");
+    for (const other of editors) {
+      if (other === editor) continue;
+      const b = other.getBoundingClientRect();
+      if (b.width === 0 || b.height === 0) continue;
+      this.ctx.rect(b.left, b.top, b.width, b.height);
+    }
+    this.ctx.clip("evenodd");
     try {
       return fn();
     } finally {
