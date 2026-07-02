@@ -234,6 +234,12 @@ function createNeovideCursor(options) {
 
   const colorObj = resolveColor(particlesColor);
   const shadowColorObj = resolveColor(shadowColor);
+  // 预算颜色的 CSS 字符串——drawCursorShape 每帧要用，避免重复拼接和 GC。
+  const colorCss = rgbaToCss(colorObj);
+  const transparentCss = "rgba(0, 0, 0, 0)";
+  const opaqueBlackCss = "rgba(0, 0, 0, 1)";
+  // shadowCss 依赖 shadowAlphaFactor，setShadowAlphaFactor 变化时重算。
+  let shadowCss = rgbaToCss(shadowColorObj);
   let cursorDimensions = { width: 8, height: 18 };
   let destination = { x: 0, y: 0 };
   let centerDestination = { x: 0, y: 0 };
@@ -248,7 +254,40 @@ function createNeovideCursor(options) {
   // 飞入时不透明。
   let currentBodyAlpha = 1;
 
+  // 离屏 shadow sprite：把静态矩形光标的 shadow 预渲染成位图，停留态直接
+  // drawImage 代替实时 shadowBlur。飞行态因为四角形变，走原始 fill+blur 路径。
+  // sprite 尺寸与 cursorDimensions 绑定，尺寸变化时重建。dying 光标每帧变化
+  // 的 shadowAlphaFactor 靠 drawImage 时的 globalAlpha 处理（高斯模糊是线性
+  // 算子，等价于对 sprite 整体缩放 alpha）。
+  let shadowSprite = null;
+  let shadowSpriteInset = 0;  // sprite 内部矩形距 sprite 边缘的空白（等于 shadowBlur*2）
+
   const corners = STANDARD_CORNERS.map(rel => new Corner(rel));
+
+  function rebuildShadowSprite() {
+    if (!useShadow) { shadowSprite = null; return; }
+    const w = cursorDimensions.width;
+    const h = cursorDimensions.height;
+    if (w <= 0 || h <= 0) { shadowSprite = null; return; }
+    // 留出 blur 半径 × 2 的边距，保证软阴影不被裁掉。
+    const pad = shadowBlur * 2;
+    const sprite = document.createElement("canvas");
+    sprite.width = Math.ceil(w + pad * 2);
+    sprite.height = Math.ceil(h + pad * 2);
+    const sctx = sprite.getContext("2d");
+    // 在 sprite 中心画矩形，触发 shadow，再用 destination-out 擦掉本体，只留光晕。
+    sctx.shadowColor = rgbaToCss(shadowColorObj);
+    sctx.shadowBlur = shadowBlur;
+    sctx.fillStyle = colorCss;
+    sctx.fillRect(pad, pad, w, h);
+    sctx.shadowColor = transparentCss;
+    sctx.shadowBlur = 0;
+    sctx.globalCompositeOperation = "destination-out";
+    sctx.fillStyle = opaqueBlackCss;
+    sctx.fillRect(pad, pad, w, h);
+    shadowSprite = sprite;
+    shadowSpriteInset = pad;
+  }
 
   function updateCursorSize(width, height) {
     if (width) cursorDimensions.width = width;
@@ -261,6 +300,7 @@ function createNeovideCursor(options) {
       x: destination.x + cursorDimensions.width / 2,
       y: destination.y + cursorDimensions.height / 2
     };
+    rebuildShadowSprite();
   }
 
   function move(x, y) {
@@ -281,37 +321,41 @@ function createNeovideCursor(options) {
     }
   }
 
-  function drawCursorShape(bodyAlpha = 1) {
+  function drawCursorShape(bodyAlpha = 1, useSprite = false) {
     if (!initialized) return;
 
     // 分两 pass 绘制以隔离 body alpha 和 shadow：
-    //   Pass 1 - 画阴影：用不透明 fill 让 canvas 生成 shadow，然后用
-    //            destination-out 把光标本体擦掉，只留下外围的 shadow 光晕。
+    //   Pass 1 - 画阴影：停留态用离屏预渲染 sprite（drawImage 代替昂贵的
+    //            shadowBlur）；飞行态因为四角形变，走 fill+blur+destination-out。
     //   Pass 2 - 画本体：按 bodyAlpha 半透明填充。
-    // canvas 的 shadow 强度是根据被绘制像素的 alpha 生成的，无法用透明 fill
-    // 直接"只画阴影"，所以走"画满再擦掉"的路子。
+    // shadowAlphaFactor 在 sprite 路径通过 globalAlpha 缩放实现（高斯模糊是
+    // 线性算子，blur(color*α) === blur(color)*α，视觉等价）。
 
-    context.beginPath();
-    context.moveTo(corners[0].currentPosition.x, corners[0].currentPosition.y);
-    for (let i = 1; i < corners.length; i++) {
-      context.lineTo(corners[i].currentPosition.x, corners[i].currentPosition.y);
-    }
-    context.closePath();
-
-    context.imageSmoothingEnabled = ANIMATION_SETTINGS.antialiasing;
-
-    // Pass 1: 阴影。不透明 fill 触发 shadow 渲染；shadowAlphaFactor 让调用方
-    // 独立压制光晕（dying 光标靠近吸附目标时用到）。
-    if (useShadow && shadowAlphaFactor > 0) {
+    if (useSprite && shadowSprite && useShadow && shadowAlphaFactor > 0) {
+      // 停留态：spring 已收敛，corners 就在原始矩形位置。用 corners[0]（左上）
+      // 作为定位锚点，扣除 sprite 的内边距即可。
       context.save();
-      context.shadowColor = rgbaToCss({
-        r: shadowColorObj.r,
-        g: shadowColorObj.g,
-        b: shadowColorObj.b,
-        a: shadowColorObj.a * shadowAlphaFactor
-      });
+      context.globalAlpha = context.globalAlpha * shadowAlphaFactor;
+      context.drawImage(
+        shadowSprite,
+        corners[0].currentPosition.x - shadowSpriteInset,
+        corners[0].currentPosition.y - shadowSpriteInset
+      );
+      context.restore();
+    } else if (useShadow && shadowAlphaFactor > 0) {
+      // 飞行态：形变矩形无法用 sprite，走实时 fill+blur。
+      context.beginPath();
+      context.moveTo(corners[0].currentPosition.x, corners[0].currentPosition.y);
+      for (let i = 1; i < corners.length; i++) {
+        context.lineTo(corners[i].currentPosition.x, corners[i].currentPosition.y);
+      }
+      context.closePath();
+      context.imageSmoothingEnabled = ANIMATION_SETTINGS.antialiasing;
+
+      context.save();
+      context.shadowColor = shadowCss;
       context.shadowBlur = shadowBlur;
-      context.fillStyle = rgbaToCss(colorObj);
+      context.fillStyle = colorCss;
       context.fill();
       context.restore();
 
@@ -319,27 +363,43 @@ function createNeovideCursor(options) {
       // 的像素，shadow 位于路径外围，不会被擦。
       context.save();
       context.globalCompositeOperation = "destination-out";
-      context.shadowColor = "rgba(0, 0, 0, 0)";
+      context.shadowColor = transparentCss;
       context.shadowBlur = 0;
-      context.fillStyle = "rgba(0, 0, 0, 1)";
+      context.fillStyle = opaqueBlackCss;
       context.fill();
       context.restore();
     }
 
     // Pass 2: 本体填充。关掉 shadow，body alpha 只影响这一层。
     if (bodyAlpha > 0) {
+      // 停留态 bodyAlpha 通常已淡到 0，直接跳过整个 fill/beginPath 开销。
+      context.beginPath();
+      context.moveTo(corners[0].currentPosition.x, corners[0].currentPosition.y);
+      for (let i = 1; i < corners.length; i++) {
+        context.lineTo(corners[i].currentPosition.x, corners[i].currentPosition.y);
+      }
+      context.closePath();
       context.save();
       context.globalAlpha = context.globalAlpha * bodyAlpha;
-      context.shadowColor = "rgba(0, 0, 0, 0)";
+      context.shadowColor = transparentCss;
       context.shadowBlur = 0;
-      context.fillStyle = rgbaToCss(colorObj);
+      context.fillStyle = colorCss;
       context.fill();
       context.restore();
     }
   }
 
   function setShadowAlphaFactor(factor) {
-    shadowAlphaFactor = clamp(factor, 0, 1);
+    const next = clamp(factor, 0, 1);
+    if (next === shadowAlphaFactor) return;
+    shadowAlphaFactor = next;
+    // 只在因子真的变化时重算 shadow CSS，避免每帧字符串拼接。
+    shadowCss = rgbaToCss({
+      r: shadowColorObj.r,
+      g: shadowColorObj.g,
+      b: shadowColorObj.b,
+      a: shadowColorObj.a * shadowAlphaFactor
+    });
   }
 
   // 返回当前几何中心到最新目标（centerDestination）的距离。dying 光标用它
@@ -400,25 +460,22 @@ function createNeovideCursor(options) {
       }
     });
 
-    // body alpha 停留时线性淡到 stationaryBodyAlpha，起步即最快速度、到点即
-     // 停，不像指数衰减那样尾巴拖长。飞行中直接硬回 1（jumped 分支已处理）。
-    const targetBodyAlpha = animating ? 1 : stationaryBodyAlpha;
-    if (currentBodyAlpha !== targetBodyAlpha) {
+    // 停下后 body alpha 线性淡到 stationaryBodyAlpha，起步即最快速度、到点
+    // 即停。飞行中始终不透明——jumped 分支已把 currentBodyAlpha 硬回到 1，
+    // spring 恢复期 animating 保持 true，不会误淡出。淡出未收敛时也算
+    // animating，驱动 loop 继续跑帧。
+    if (!animating && currentBodyAlpha > stationaryBodyAlpha) {
       const step = bodyAlphaFadeDuration > 0 ? dt / bodyAlphaFadeDuration : 1;
-      if (currentBodyAlpha > targetBodyAlpha) {
-        currentBodyAlpha = Math.max(targetBodyAlpha, currentBodyAlpha - step);
-      } else {
-        currentBodyAlpha = Math.min(targetBodyAlpha, currentBodyAlpha + step);
-      }
-      // 淡出未收敛也算 animating，驱动 loop 继续跑帧，否则 spring 一停 loop
-      // 也停，看不到淡出过程。
-      if (currentBodyAlpha !== targetBodyAlpha) animating = true;
+      currentBodyAlpha = Math.max(stationaryBodyAlpha, currentBodyAlpha - step);
+      if (currentBodyAlpha > stationaryBodyAlpha) animating = true;
     }
 
     if (shouldDraw) {
       // dying 光标在到达吸附目标前 animating 恒为 true，本体一直是 1，外层
       // globalAlpha 负责时间淡出；此处不干扰它。
-      drawCursorShape(currentBodyAlpha);
+      // useSprite = !animating：spring 收敛后 corners 就在原始矩形四角，可
+      // 以走离屏 sprite 快速路径；飞行中 corners 形变，必须走实时 fill+blur。
+      drawCursorShape(currentBodyAlpha, !animating);
     }
 
     jumped = false;
@@ -439,6 +496,18 @@ class GlobalCursorManager {
     // Map 的插入序，因为 scanCursors 是按 DOM 文档顺序遍历，新增的光标若位于
     // 文档更靠前的位置，会被排到已有光标前面，与真实创建顺序不符。
     this.creationCounter = 0;
+    // 已排队的 rAF 句柄。null 表示当前没有 pending 帧——外部事件通过
+    // requestFrame() 唤醒 loop；loop() 结束时若还有 animating 光标，也会
+    // 自己 requestFrame() 续下一帧。空闲态整个 rAF 队列静默，CPU 降到 ~0。
+    this._rafId = null;
+    // 本帧 editor rect 缓存：runWithEditorClip 首次访问时 populate，同帧内
+    // 所有光标复用，避免 N·M 次 querySelectorAll + getBoundingClientRect。
+    // loop() 开头置为 null；每帧结束自然回收。
+    this._frameEditorRects = null;
+    // updateCursor 每帧要判断 target 所在窗格是否 focused，原来靠
+    // getComputedStyle。改为 focusout/focusin 事件维护 focusedEditor，
+    // updateCursor 只做引用比较。
+    this._focusedEditor = document.querySelector(".monaco-editor.focused");
     this.init();
   }
 
@@ -452,7 +521,10 @@ class GlobalCursorManager {
     this.canvas.style.height = "100vh";
     document.body.appendChild(this.canvas);
 
-    window.addEventListener("resize", () => this.updateCanvasSize());
+    window.addEventListener("resize", () => {
+      this.updateCanvasSize();
+      this.requestFrame();
+    });
     this.updateCanvasSize();
 
     document.addEventListener('scroll', () => {
@@ -461,11 +533,18 @@ class GlobalCursorManager {
       this.scrollTimeout = setTimeout(() => {
         this.isScrolling = false;
       }, 100);
+      this.requestFrame();
     }, { capture: true, passive: true });
 
-    this.loop();
+    this.requestFrame();
 
-    setInterval(() => this.scanCursors(), cursorUpdatePollingRate);
+    setInterval(() => {
+      this.scanCursors();
+      // 兜底：某些 Monaco 内部路径可能不通过 style 属性改变而移位光标（例如
+      // CSS transform 或滚动补偿）。轮询扫描一次并唤醒一帧，让 updateCursor
+      // 兜底重读 rect。
+      this.requestFrame();
+    }, cursorUpdatePollingRate);
 
     // 通过 MutationObserver 立即响应 .cursor 节点的增删，消除 Ctrl+D 等操作
     // 到动画启动之间的轮询延迟。轮询保留作为兜底，避免观察范围之外遗漏。
@@ -478,6 +557,9 @@ class GlobalCursorManager {
           requestAnimationFrame(() => {
             this.pendingScan = false;
             this.scanCursors();
+            // scanCursors 里注册新光标会调 requestFrame；这里补一次确保
+            // 光标销毁触发 dying 时也能立刻续帧。
+            this.requestFrame();
           });
           return;
         }
@@ -490,7 +572,27 @@ class GlobalCursorManager {
     // 位置，产生跨窗格切换的动画。
     this.lastActiveEditor = null;
     this.lastActiveCursorPos = null;
-    document.addEventListener("focusin", (e) => this.handleFocusChange(e.target), true);
+    document.addEventListener("focusin", (e) => {
+      this._focusedEditor = e.target?.closest?.(".monaco-editor") || null;
+      this.handleFocusChange(e.target);
+      this.requestFrame();
+    }, true);
+    document.addEventListener("focusout", () => {
+      // focusout 早于 focusin，先清空；随后的 focusin 会补上正确值。若
+      // focusout 后没有 focusin（焦点飘到 window 之外），保持 null。
+      this._focusedEditor = null;
+      this.requestFrame();
+    }, true);
+  }
+
+  // 唯一的 rAF 入口。已有 pending 帧时直接返回，避免同一帧被 schedule 多次。
+  // loop() 内部若发现还有动画未收敛，也会调这里续下一帧。
+  requestFrame() {
+    if (this._rafId != null) return;
+    this._rafId = requestAnimationFrame(() => {
+      this._rafId = null;
+      this.loop();
+    });
   }
 
   handleFocusChange(target) {
@@ -578,8 +680,30 @@ class GlobalCursorManager {
   }
 
   updateCanvasSize() {
-    this.canvas.width = window.innerWidth;
-    this.canvas.height = window.innerHeight;
+    // 对齐 devicePixelRatio：canvas 内部像素密度与屏幕匹配，光标和阴影在
+    // Retina/高 DPI 屏上不再模糊。用 setTransform 而不是缩放 style，避免
+    // 后续 ctx 绘制坐标改变——上层代码用 CSS 像素坐标即可。
+    const dpr = window.devicePixelRatio || 1;
+    this.canvas.width = window.innerWidth * dpr;
+    this.canvas.height = window.innerHeight * dpr;
+    this.canvas.style.width = window.innerWidth + "px";
+    this.canvas.style.height = window.innerHeight + "px";
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  // 给 .cursor 挂 style 属性 observer：Monaco 只在真正移位时改 style，
+  // 这就相当于"光标移动事件"。触发时唤醒一帧让 updateCursor 重读 rect。
+  _observeCursorTarget(target) {
+    const obs = new MutationObserver(() => this.requestFrame());
+    obs.observe(target, { attributes: true, attributeFilter: ["style"] });
+    return obs;
+  }
+
+  _removeCursor(id) {
+    const data = this.cursors.get(id);
+    if (!data) return;
+    if (data.observer) data.observer.disconnect();
+    this.cursors.delete(id);
   }
 
   scanCursors() {
@@ -660,8 +784,14 @@ class GlobalCursorManager {
           lastWidth: rect.width,
           lastHeight: rect.height,
           createdAt: ++this.creationCounter,
-          dying: false
+          dying: false,
+          // Monaco 只在真正移位时改 .cursor 的 style 属性；挂个属性 observer
+          // 就能替代每帧 rect 轮询：光标一动就唤醒 loop，其他时间 rAF 保持
+          // 停止状态。dispose 在 loop() 删除光标处调用。
+          observer: this._observeCursorTarget(target)
         });
+        // 新光标注册后立即唤醒一帧，让它至少绘制一次到当前位置。
+        this.requestFrame();
       }
     });
 
@@ -674,7 +804,7 @@ class GlobalCursorManager {
       // 失）时直接删除。
       const suckTarget = this.findSuckTarget(data);
       if (!suckTarget) {
-        this.cursors.delete(id);
+        this._removeCursor(id);
         continue;
       }
       this.startDying(data, suckTarget);
@@ -712,7 +842,14 @@ class GlobalCursorManager {
   }
 
   loop() {
-    this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    // clearRect 走当前 transform，所以用 CSS 像素尺寸即可（不是 canvas.width，
+    // 那是含 dpr 放大后的物理像素）。
+    this.ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    // 本帧的 editor rect 缓存：runWithEditorClip 首次使用时 populate 一次，
+    // 同一帧内所有光标复用；帧结束不显式清理，下帧开头重置。
+    this._frameEditorRects = null;
+
+    let anyAnimating = false;
 
     for (const [id, data] of this.cursors) {
       if (data.dying) {
@@ -724,7 +861,7 @@ class GlobalCursorManager {
         const elapsed = performance.now() - data.dyingAt;
         const bodyAlpha = Math.max(0, 1 - elapsed / data.fadeDuration);
         if (bodyAlpha <= 0) {
-          this.cursors.delete(id);
+          this._removeCursor(id);
           continue;
         }
         const dist = data.instance.getDistanceToDestination();
@@ -744,7 +881,10 @@ class GlobalCursorManager {
           data.instance.updateLoopLogic(this.isScrolling, true)
         );
         this.ctx.restore();
-        if (!animating) this.cursors.delete(id);
+        // dying 光标只要还没到点就要续帧，即使 spring 已经收敛也得让淡出
+        // 走完（cursors.delete 在下一帧 bodyAlpha<=0 时触发）。
+        anyAnimating = true;
+        if (!animating) this._removeCursor(id);
         continue;
       }
       // DOM 节点被移除但还未走到 scanCursors 的兜底路径（例如 loop 早于下一次
@@ -754,12 +894,13 @@ class GlobalCursorManager {
         const suckTarget = this.findSuckTarget(data);
         if (suckTarget) {
           this.startDying(data, suckTarget);
+          anyAnimating = true;
         } else {
-          this.cursors.delete(id);
+          this._removeCursor(id);
         }
         continue;
       }
-      this.updateCursor(data);
+      if (this.updateCursor(data)) anyAnimating = true;
     }
 
     // 每帧刷新当前活跃窗格的锚点位置，让跨窗格切换的动画起点始终跟随最近
@@ -769,23 +910,19 @@ class GlobalCursorManager {
       if (anchor) this.lastActiveCursorPos = anchor;
     }
 
-    requestAnimationFrame(() => this.loop());
+    // 有动画未收敛就续下一帧；全部收敛就把 rAF 停下，等外部事件唤醒。
+    if (anyAnimating) this.requestFrame();
   }
 
   updateCursor(data) {
     const { instance, target } = data;
 
-    const computed = getComputedStyle(target);
-    if (computed.visibility === "hidden" || computed.display === "none" || parseFloat(computed.opacity) < 0.05) {
-      return;
-    }
-
-    // 窗格失焦后 Monaco 会给 .cursor 做 opacity 淡出过渡，同时移除父级
-    // .monaco-editor 上的 focused 类。仅靠 opacity 判断会读到 "0.6" 这类
-    // 中间值，导致淡出期间光标继续被绘制，产生切换窗格时的短暂残留。
-    const editor = target.closest(".monaco-editor");
-    if (editor && !editor.classList.contains("focused")) {
-      return;
+    // 窗格未 focused（Monaco 会在失焦后对 .cursor 做 opacity 淡出，此期间
+    // 还会绘制若干帧）：直接跳过，不占用绘制。原来靠 getComputedStyle 判定
+    // 每帧强制样式重算；改为 focusin/focusout 事件维护 _focusedEditor，
+    // 引用比较即可。
+    if (data.editor && data.editor !== this._focusedEditor) {
+      return false;
     }
 
     const rect = target.getBoundingClientRect();
@@ -793,7 +930,7 @@ class GlobalCursorManager {
     // 否则 pickEditorAnchor 会把 (0,0) 作为跨窗格切换的起点，让下一个焦点
     // 光标从左上角飞出。同样跳过尺寸更新——用 0 宽/高重算 centerDestination
     // 会把动画目的地推到窗格原点。
-    if (!isValidCursorRect(rect)) return;
+    if (!isValidCursorRect(rect)) return false;
 
     const isOffScreen = rect.right < 0 || rect.bottom < 0 ||
       rect.left > window.innerWidth || rect.top > window.innerHeight;
@@ -825,7 +962,7 @@ class GlobalCursorManager {
     // 邻居窗格的内容里；飞行途中（跨窗格切换的动画中段）临时放开 clip，让
     // 光标可以穿越其他窗格，否则动画会被邻居窗格咬掉一段看起来断开了。
     const flying = instance.getDistanceToDestination() > CLIP_DISTANCE_THRESHOLD;
-    this.runWithEditorClip(editor, flying, () =>
+    return this.runWithEditorClip(data.editor, flying, () =>
       instance.updateLoopLogic(this.isScrolling, !isOffScreen)
     );
   }
@@ -839,14 +976,16 @@ class GlobalCursorManager {
     if (flying) return fn();
     this.ctx.save();
     this.ctx.beginPath();
-    // 外框：整块 canvas。所有绘制默认落在这里。
-    this.ctx.rect(0, 0, this.canvas.width, this.canvas.height);
+    // 外框：整块 canvas（CSS 像素）。所有绘制默认落在这里。
+    this.ctx.rect(0, 0, window.innerWidth, window.innerHeight);
     // 内框：每个"其他窗格"。evenodd 会把这些矩形从允许区里挖掉。
-    const editors = document.querySelectorAll(".monaco-editor");
-    for (const other of editors) {
-      if (other === editor) continue;
-      const b = other.getBoundingClientRect();
-      if (b.width === 0 || b.height === 0) continue;
+    // 本帧缓存：多光标 / 多分屏时同一帧内所有光标共用一份 editor 列表，避免
+    // 重复 querySelectorAll 和 getBoundingClientRect。loop() 每帧开头把
+    // _frameEditorRects 置 null 触发下一次重建。
+    const rects = this._getFrameEditorRects();
+    for (const entry of rects) {
+      if (entry.editor === editor) continue;
+      const b = entry.rect;
       this.ctx.rect(b.left, b.top, b.width, b.height);
     }
     this.ctx.clip("evenodd");
@@ -855,6 +994,19 @@ class GlobalCursorManager {
     } finally {
       this.ctx.restore();
     }
+  }
+
+  _getFrameEditorRects() {
+    if (this._frameEditorRects) return this._frameEditorRects;
+    const editors = document.querySelectorAll(".monaco-editor");
+    const out = [];
+    for (const editor of editors) {
+      const rect = editor.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      out.push({ editor, rect });
+    }
+    this._frameEditorRects = out;
+    return out;
   }
 }
 
