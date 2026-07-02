@@ -369,7 +369,6 @@ function createNeovideCursor(options) {
         context.lineTo(corners[i].currentPosition.x, corners[i].currentPosition.y);
       }
       context.closePath();
-      context.imageSmoothingEnabled = ANIMATION_SETTINGS.antialiasing;
 
       context.save();
       context.shadowColor = shadowCss;
@@ -571,11 +570,8 @@ class GlobalCursorManager {
 
     setInterval(() => {
       this.scanCursors();
-      // 兜底：某些 Monaco 内部路径可能不通过 style 属性改变而移位光标（例如
-      // CSS transform 或滚动补偿）。把所有光标标脏，强制一次 rect 重读，避免
-      // dirty flag 优化把这些漏事件的位置变化也漏掉。
-      for (const data of this.cursors.values()) data.dirty = true;
-      this.requestFrame();
+      // 光标的 dirty 标记和 requestFrame 已由 33ms 空闲轮询覆盖，
+      // 这里只做 DOM 发现（新增/移除 .cursor 节点的兜底扫描）。
     }, cursorUpdatePollingRate);
 
     // 通过 MutationObserver 立即响应 .cursor 节点的增删，消除 Ctrl+D 等操作
@@ -839,6 +835,14 @@ class GlobalCursorManager {
       }
     });
 
+    // 若有同窗格新光标注册，说明之前标记的 dying 光标是 DOM 重建而非真正
+    // 退出多光标——直接删除，不播放吸回动画（否则旧位置会残留孤儿光晕）。
+    const crossScanRemovals = [];
+    for (const [id, data] of this.cursors) {
+      if (data.dying && editorsWithNewCursors.has(data.editor)) crossScanRemovals.push(id);
+    }
+    for (const id of crossScanRemovals) this._removeCursor(id);
+
     for (const [id, data] of this.cursors) {
       if (nowIds.has(id)) continue;
       if (data.dying) continue;
@@ -929,10 +933,12 @@ class GlobalCursorManager {
           data.instance.updateLoopLogic(this.isScrolling, true)
         );
         this.ctx.restore();
-        // dying 光标只要还没到点就要续帧，即使 spring 已经收敛也得让淡出
-        // 走完（cursors.delete 在下一帧 bodyAlpha<=0 时触发）。
-        anyAnimating = true;
-        if (!animating) this._removeCursor(id);
+        // spring 收敛后直接删除不续帧；还在淡出中则续帧让 alpha 走完。
+        if (!animating) {
+          this._removeCursor(id);
+        } else {
+          anyAnimating = true;
+        }
         continue;
       }
       // DOM 断连但 scanCursors 尚未执行。滚动期间 Monaco 重建元素导致
@@ -964,7 +970,7 @@ class GlobalCursorManager {
     // Monaco 使用程序化滚动（CSS transform），不触发浏览器 scroll 事件。
     // 无论动画是否在跑，每 ~33ms 标脏一次确保光标目标始终与 DOM 同步。
     // 动画期间 requestFrame 是 no-op，但 dirty 会在下一帧触发位置重读。
-    if (this._idleCheckId == null) {
+    if (this._idleCheckId == null && this.cursors.size > 0) {
       this._idleCheckId = setTimeout(() => {
         this._idleCheckId = null;
         for (const data of this.cursors.values()) data.dirty = true;
