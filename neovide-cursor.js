@@ -230,6 +230,14 @@ function createNeovideCursor(options) {
   function updateCursorSize(width, height) {
     if (width) cursorDimensions.width = width;
     if (height) cursorDimensions.height = height;
+    // 宽高变化后必须同步刷新 centerDestination：half-width↔full-width 切换时
+    // Monaco 会改变光标 rect.width（8↔16），若 centerDestination 仍沿用旧宽度
+    // 推得的中心点，四个角就会算到"以旧中心 + 新宽度"的位置上，视觉上光标
+    // 覆盖会整体偏离字符格。
+    centerDestination = {
+      x: destination.x + cursorDimensions.width / 2,
+      y: destination.y + cursorDimensions.height / 2
+    };
   }
 
   function move(x, y) {
@@ -542,6 +550,8 @@ class GlobalCursorManager {
           editor: target.closest(".monaco-editor"),
           lastX: rect.left,
           lastY: rect.top,
+          lastWidth: rect.width,
+          lastHeight: rect.height,
           createdAt: ++this.creationCounter,
           dying: false
         });
@@ -675,9 +685,25 @@ class GlobalCursorManager {
     const isOffScreen = rect.right < 0 || rect.bottom < 0 ||
       rect.left > window.innerWidth || rect.top > window.innerHeight;
 
+    // 尺寸变化独立于位置变化处理：全角↔半角切换时 rect.left/top 可能保持
+    // 不变，只有 rect.width 会从 8 跳到 16（或反之）。若把尺寸更新塞进下面
+    // 的位置分支里，就会漏掉这种"原地变宽"的情况，动画光标会继续用旧宽度
+    // 绘制，出现覆盖错位。此外必须先 updateCursorSize 再 move，保证 move
+    // 内部按新宽度重算 centerDestination。
+    if (rect.width !== data.lastWidth || rect.height !== data.lastHeight) {
+      instance.updateCursorSize(rect.width, rect.height);
+      data.lastWidth = rect.width;
+      data.lastHeight = rect.height;
+      // 宽度变了、但位置没变时，也需要触发一次 move 让 centerDestination
+      // 与新几何绑定并把动画目标推给 corners（updateCursorSize 内部只更新
+      // centerDestination，不会通知 corners 重新计算目的地）。
+      if (rect.left === data.lastX && rect.top === data.lastY) {
+        instance.move(rect.left, rect.top);
+      }
+    }
+
     if (rect.left !== data.lastX || rect.top !== data.lastY) {
       instance.move(rect.left, rect.top);
-      instance.updateCursorSize(rect.width, rect.height);
       data.lastX = rect.left;
       data.lastY = rect.top;
     }
