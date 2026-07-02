@@ -179,7 +179,7 @@ class Corner {
     const cornerDestination = this.getDestination(destination, cursorDimensions);
 
     if (cornerDestination.x !== this.previousDestination.x || cornerDestination.y !== this.previousDestination.y) {
-      // 滚动瞬移时 delta 算完立刻被下面的 reset() 归零——省掉无用的计算和赋值。
+      // 瞬移时 delta 赋值完立刻被 reset() 归零，跳过省掉无用计算。
       if (!immediate) {
         const delta = {
           x: cornerDestination.x - this.currentPosition.x,
@@ -463,9 +463,8 @@ function createNeovideCursor(options) {
     const immediateMovement = isScrolling;
 
     if (jumped) {
-      // 滚动中 corner.update(immediate=true) 会在后面直接瞬移并重置弹簧，
-      // jump() 设置的 animationLength 和弹簧归零完全被覆盖——跳过角排名和
-      // jump 省掉每帧 4 次 calculateDirectionAlignment 的无用计算。
+      // 滚动瞬移时 corner.update(immediate=true) 会覆盖 jump() 的全部效果，
+      // 跳过角排名和弹簧重置省掉每帧 4 次 calculateDirectionAlignment。
       if (!immediateMovement) {
         const ranks = computeCornerRanks(corners, cursorDimensions, centerDestination);
         corners.forEach((corner, index) => {
@@ -524,9 +523,8 @@ class GlobalCursorManager {
     // requestFrame() 唤醒 loop；loop() 结束时若还有 animating 光标，也会
     // 自己 requestFrame() 续下一帧。空闲态整个 rAF 队列静默，CPU 降到 ~0。
     this._rafId = null;
-    // 空闲态位置轮询：VS Code 的 Monaco 使用程序化滚动不触发浏览器 scroll
-    // 事件，loop 空闲后无法被外部事件唤醒。此定时器以 50ms 间隔自唤醒，
-    // 确保光标位置始终与 DOM 同步。
+    // Monaco 使用 CSS transform 程序化滚动不触发 scroll 事件，loop 空闲后
+    // 由此定时器自唤醒，确保光标位置与 DOM 保持同步。
     this._idleCheckId = null;
     // 本帧 editor rect 缓存：runWithEditorClip 首次访问时 populate，同帧内
     // 所有光标复用，避免 N·M 次 querySelectorAll + getBoundingClientRect。
@@ -562,9 +560,6 @@ class GlobalCursorManager {
       clearTimeout(this.scrollTimeout);
       this.scrollTimeout = setTimeout(() => {
         this.isScrolling = false;
-        // 滚动结束后强制重读所有光标的位置，杜绝最后一帧的残留过期坐标。
-        for (const data of this.cursors.values()) data.dirty = true;
-        this.requestFrame();
       }, 100);
       // 滚动会移动光标的屏幕坐标但不改 .cursor 的 style（transform 是编辑器
       // 内容层做的），style observer 捕捉不到——必须显式标脏。
@@ -834,8 +829,7 @@ class GlobalCursorManager {
           dirty: true,
           observer: null,
         };
-        // 记录同窗格有新光标注册——后续移除检查时，若发现旧光标所在窗格
-        // 已有新光标，说明是 Monaco 重建 DOM 而非真正退出多光标，直接删除即可。
+        // 同窗格有新光标注册，说明这是 DOM 重建而非真正退出多光标。
         if (data.editor) editorsWithNewCursors.add(data.editor);
         // observer 需要引用 data 来置 dirty，所以要在 data 创建后再挂。
         data.observer = this._observeCursorTarget(target, data);
@@ -848,10 +842,8 @@ class GlobalCursorManager {
     for (const [id, data] of this.cursors) {
       if (nowIds.has(id)) continue;
       if (data.dying) continue;
-      // 滚动期间 Monaco 可能移除/重建 .cursor DOM 而非原地移动它，此时不应
-      // 播放"吸回"动画——那会在旧位置留下孤儿光晕然后弹簧拖尾。直接删除即可。
-      // 同理，若同一扫描周期内同窗格已有新光标注册，说明这是替换而非真正的
-      // 多光标退出，也直接删除。
+      // 滚动或同窗格 DOM 重建时直接删除，不播放吸回动画——否则旧位置
+      // 会残留孤儿光晕，弹簧飞行产生拖尾。
       if (this.isScrolling || editorsWithNewCursors.has(data.editor)) {
         this._removeCursor(id);
         continue;
@@ -943,9 +935,8 @@ class GlobalCursorManager {
         if (!animating) this._removeCursor(id);
         continue;
       }
-      // DOM 节点被移除但还未走到 scanCursors 的兜底路径（例如 loop 早于下一次
-      // scan 触发）：这里不再直接 delete，先启动吸回动画，找不到吸附目标时才
-      // 真正丢弃。滚动期间 DOM 移除是 Monaco 重建元素导致的，直接删除不播放动画。
+      // DOM 断连但 scanCursors 尚未执行。滚动期间 Monaco 重建元素导致
+      // 断连时直接删除，不播放吸回动画。
       if (!data.target.isConnected) {
         if (this.isScrolling) {
           this._removeCursor(id);
@@ -970,18 +961,16 @@ class GlobalCursorManager {
       if (anchor) this.lastActiveCursorPos = anchor;
     }
 
-    // 空闲位置轮询：VS Code 的 Monaco 使用程序化滚动不触发浏览器 scroll
-    // 事件。无论动画是否在跑，每 50ms 标脏一次强制下帧读 DOM，确保光标目标
-    // 始终与真实位置同步。动画跑着时 requestFrame() 是 no-op（_rafId 已设），
-    // 但 dirty 标记会在当前动画帧的下一次 rAF 中触发位置重读。
+    // Monaco 使用程序化滚动（CSS transform），不触发浏览器 scroll 事件。
+    // 无论动画是否在跑，每 ~33ms 标脏一次确保光标目标始终与 DOM 同步。
+    // 动画期间 requestFrame 是 no-op，但 dirty 会在下一帧触发位置重读。
     if (this._idleCheckId == null) {
       this._idleCheckId = setTimeout(() => {
         this._idleCheckId = null;
         for (const data of this.cursors.values()) data.dirty = true;
         this.requestFrame();
-      }, 50);
+      }, 33);
     }
-    // 有动画未收敛就续下一帧
     if (anyAnimating) this.requestFrame();
   }
 
