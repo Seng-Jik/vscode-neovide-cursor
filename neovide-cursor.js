@@ -517,7 +517,10 @@ class GlobalCursorManager {
     });
     this.updateCanvasSize();
 
-    document.addEventListener('scroll', () => {
+    document.addEventListener('scroll', (e) => {
+      // 只响应编辑器区域内的滚动；文件浏览器、终端等面板的滚动不应
+      // 触发光标标脏，否则 isScrolling=true 会错误跳过吸回动画。
+      if (!e.target.closest?.(".monaco-editor")) return;
       this.isScrolling = true;
       clearTimeout(this.scrollTimeout);
       this.scrollTimeout = setTimeout(() => {
