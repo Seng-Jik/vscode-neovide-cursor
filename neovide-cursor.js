@@ -161,7 +161,7 @@ class Corner {
     return travelDirection.x * cornerDirection.x + travelDirection.y * cornerDirection.y;
   }
 
-  jump(destination, cursorDimensions, rank) {
+  jump(cursorDimensions, rank) {
     const leading = ANIMATION_SETTINGS.animationLength * clamp(1 - ANIMATION_SETTINGS.trailSize, 0, 1);
     const trailing = ANIMATION_SETTINGS.animationLength;
     if (rank >= 2) {
@@ -311,26 +311,25 @@ function createNeovideCursor(options) {
     // Monaco 会改变光标 rect.width（8↔16），若 centerDestination 仍沿用旧宽度
     // 推得的中心点，四个角就会算到"以旧中心 + 新宽度"的位置上，视觉上光标
     // 覆盖会整体偏离字符格。
-    centerDestination = {
-      x: destination.x + cursorDimensions.width / 2,
-      y: destination.y + cursorDimensions.height / 2
-    };
+    centerDestination.x = destination.x + cursorDimensions.width / 2;
+    centerDestination.y = destination.y + cursorDimensions.height / 2;
     rebuildShadowSprite();
   }
 
   function move(x, y) {
-    destination = { x, y };
-    centerDestination = {
-      x: destination.x + cursorDimensions.width / 2,
-      y: destination.y + cursorDimensions.height / 2
-    };
+    destination.x = x;
+    destination.y = y;
+    centerDestination.x = destination.x + cursorDimensions.width / 2;
+    centerDestination.y = destination.y + cursorDimensions.height / 2;
     jumped = true;
 
     if (!initialized) {
       corners.forEach(corner => {
         const cornerDest = corner.getDestination(centerDestination, cursorDimensions);
-        corner.currentPosition = { ...cornerDest };
-        corner.previousDestination = { ...cornerDest };
+        corner.currentPosition.x = cornerDest.x;
+        corner.currentPosition.y = cornerDest.y;
+        corner.previousDestination.x = cornerDest.x;
+        corner.previousDestination.y = cornerDest.y;
       });
       initialized = true;
     }
@@ -339,18 +338,8 @@ function createNeovideCursor(options) {
   function drawCursorShape(bodyAlpha = 1, useSprite = false) {
     if (!initialized) return;
 
-    // 分两 pass 绘制以隔离 body alpha 和 shadow：
-    //   Pass 1 - 画阴影：停留态用离屏预渲染 sprite（drawImage 代替昂贵的
-    //            shadowBlur）；飞行态因为四角形变，走 fill+blur+destination-out。
-    //   Pass 2 - 画本体：按 bodyAlpha 半透明填充。
-    // shadowAlphaFactor 在 sprite 路径通过 globalAlpha 缩放实现（高斯模糊是
-    // 线性算子，blur(color*α) === blur(color)*α，视觉等价）。
-
+    // Pass 1 — 阴影：停留态用离屏 sprite，飞行态用实时 fill+blur。
     if (useSprite && shadowSprite && useShadow && shadowAlphaFactor > 0) {
-      // 停留态：spring 已收敛，corners 就在原始矩形位置。用 corners[0]（左上）
-      // 作为定位锚点，扣除 sprite 的内边距即可。9-arg drawImage 明确目标 CSS
-      // 尺寸——sprite 内部是物理像素，直接 3-arg drawImage 会用物理像素当 CSS
-      // 尺寸导致光晕放大且模糊。
       context.save();
       context.globalAlpha = context.globalAlpha * shadowAlphaFactor;
       context.drawImage(
@@ -361,15 +350,21 @@ function createNeovideCursor(options) {
         shadowSpriteCssWidth, shadowSpriteCssHeight
       );
       context.restore();
-    } else if (useShadow && shadowAlphaFactor > 0) {
-      // 飞行态：形变矩形无法用 sprite，走实时 fill+blur。
+    }
+
+    // 飞行态阴影或本体需要绘制时，构建一次四边形路径供两者共用。
+    // Canvas fill() 不消费路径，可多次 fill。停留态 bodyAlpha=0 时跳过。
+    const needPath = (!useSprite && useShadow && shadowAlphaFactor > 0) || bodyAlpha > 0;
+    if (needPath) {
       context.beginPath();
       context.moveTo(corners[0].currentPosition.x, corners[0].currentPosition.y);
       for (let i = 1; i < corners.length; i++) {
         context.lineTo(corners[i].currentPosition.x, corners[i].currentPosition.y);
       }
       context.closePath();
+    }
 
+    if (!useSprite && useShadow && shadowAlphaFactor > 0) {
       context.save();
       context.shadowColor = shadowCss;
       context.shadowBlur = shadowBlur;
@@ -377,8 +372,7 @@ function createNeovideCursor(options) {
       context.fill();
       context.restore();
 
-      // 擦掉刚画上的本体，保留 shadow。destination-out 只影响 canvas 上已有
-      // 的像素，shadow 位于路径外围，不会被擦。
+      // destination-out 擦掉本体只留阴影
       context.save();
       context.globalCompositeOperation = "destination-out";
       context.shadowColor = transparentCss;
@@ -388,15 +382,8 @@ function createNeovideCursor(options) {
       context.restore();
     }
 
-    // Pass 2: 本体填充。关掉 shadow，body alpha 只影响这一层。
+    // Pass 2 — 本体
     if (bodyAlpha > 0) {
-      // 停留态 bodyAlpha 通常已淡到 0，直接跳过整个 fill/beginPath 开销。
-      context.beginPath();
-      context.moveTo(corners[0].currentPosition.x, corners[0].currentPosition.y);
-      for (let i = 1; i < corners.length; i++) {
-        context.lineTo(corners[i].currentPosition.x, corners[i].currentPosition.y);
-      }
-      context.closePath();
       context.save();
       context.globalAlpha = context.globalAlpha * bodyAlpha;
       context.shadowColor = transparentCss;
@@ -435,16 +422,17 @@ function createNeovideCursor(options) {
   }
 
   function setPosition(x, y) {
-    destination = { x, y };
-    centerDestination = {
-      x: destination.x + cursorDimensions.width / 2,
-      y: destination.y + cursorDimensions.height / 2,
-    };
+    destination.x = x;
+    destination.y = y;
+    centerDestination.x = destination.x + cursorDimensions.width / 2;
+    centerDestination.y = destination.y + cursorDimensions.height / 2;
 
     corners.forEach(corner => {
       const dest = corner.getDestination(centerDestination, cursorDimensions);
-      corner.currentPosition = { ...dest };
-      corner.previousDestination = { ...dest };
+      corner.currentPosition.x = dest.x;
+      corner.currentPosition.y = dest.y;
+      corner.previousDestination.x = dest.x;
+      corner.previousDestination.y = dest.y;
       corner.animationX.reset();
       corner.animationY.reset();
     });
@@ -467,7 +455,7 @@ function createNeovideCursor(options) {
       if (!immediateMovement) {
         const ranks = computeCornerRanks(corners, cursorDimensions, centerDestination);
         corners.forEach((corner, index) => {
-          corner.jump(centerDestination, cursorDimensions, ranks[index]);
+          corner.jump(cursorDimensions, ranks[index]);
         });
       }
       // 新动画启动的瞬间硬切到不透明，避免从"停留态透明"渐入 1 时，飞行途中
