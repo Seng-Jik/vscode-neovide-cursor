@@ -539,6 +539,8 @@ class GlobalCursorManager {
 
     window.addEventListener("resize", () => {
       this.updateCanvasSize();
+      // 窗口尺寸变化通常伴随布局重排，光标绝对坐标会变。
+      for (const data of this.cursors.values()) data.dirty = true;
       this.requestFrame();
     });
     this.updateCanvasSize();
@@ -549,6 +551,9 @@ class GlobalCursorManager {
       this.scrollTimeout = setTimeout(() => {
         this.isScrolling = false;
       }, 100);
+      // 滚动会移动光标的屏幕坐标但不改 .cursor 的 style（transform 是编辑器
+      // 内容层做的），style observer 捕捉不到——必须显式标脏。
+      for (const data of this.cursors.values()) data.dirty = true;
       this.requestFrame();
     }, { capture: true, passive: true });
 
@@ -557,8 +562,9 @@ class GlobalCursorManager {
     setInterval(() => {
       this.scanCursors();
       // 兜底：某些 Monaco 内部路径可能不通过 style 属性改变而移位光标（例如
-      // CSS transform 或滚动补偿）。轮询扫描一次并唤醒一帧，让 updateCursor
-      // 兜底重读 rect。
+      // CSS transform 或滚动补偿）。把所有光标标脏，强制一次 rect 重读，避免
+      // dirty flag 优化把这些漏事件的位置变化也漏掉。
+      for (const data of this.cursors.values()) data.dirty = true;
       this.requestFrame();
     }, cursorUpdatePollingRate);
 
@@ -591,6 +597,9 @@ class GlobalCursorManager {
     document.addEventListener("focusin", (e) => {
       this._focusedEditor = e.target?.closest?.(".monaco-editor") || null;
       this.handleFocusChange(e.target);
+      // 焦点切换可能让新聚焦窗格里之前"未 focused 被跳过"的光标需要重新绘制，
+      // 位置也可能在被跳过的期间已经变了——标脏保险。
+      for (const data of this.cursors.values()) data.dirty = true;
       this.requestFrame();
     }, true);
     document.addEventListener("focusout", () => {
@@ -708,9 +717,13 @@ class GlobalCursorManager {
   }
 
   // 给 .cursor 挂 style 属性 observer：Monaco 只在真正移位时改 style，
-  // 这就相当于"光标移动事件"。触发时唤醒一帧让 updateCursor 重读 rect。
-  _observeCursorTarget(target) {
-    const obs = new MutationObserver(() => this.requestFrame());
+  // 这就相当于"光标移动事件"。触发时唤醒一帧并把光标标记为脏，让 updateCursor
+  // 重读 rect；稳态帧 dirty=false 可以完全跳过 getBoundingClientRect。
+  _observeCursorTarget(target, data) {
+    const obs = new MutationObserver(() => {
+      data.dirty = true;
+      this.requestFrame();
+    });
     obs.observe(target, { attributes: true, attributeFilter: ["style"] });
     return obs;
   }
@@ -789,7 +802,7 @@ class GlobalCursorManager {
           instance.setPosition(rect.left, rect.top);
         }
 
-        this.cursors.set(cursorId, {
+        const data = {
           instance,
           target: target,
           // 缓存所在窗格：DOM 被销毁后 target.closest 会返回 null，吸回动画找
@@ -801,11 +814,15 @@ class GlobalCursorManager {
           lastHeight: rect.height,
           createdAt: ++this.creationCounter,
           dying: false,
-          // Monaco 只在真正移位时改 .cursor 的 style 属性；挂个属性 observer
-          // 就能替代每帧 rect 轮询：光标一动就唤醒 loop，其他时间 rAF 保持
-          // 停止状态。dispose 在 loop() 删除光标处调用。
-          observer: this._observeCursorTarget(target)
-        });
+          // dirty 标记：true 表示 updateCursor 需要重读 rect（位置/尺寸可能变了）。
+          // style observer 触发时置 true；updateCursor 消费后清零。稳态帧
+          // dirty=false 直接跳过 getBoundingClientRect，节省布局开销。
+          dirty: true,
+          observer: null,
+        };
+        // observer 需要引用 data 来置 dirty，所以要在 data 创建后再挂。
+        data.observer = this._observeCursorTarget(target, data);
+        this.cursors.set(cursorId, data);
         // 新光标注册后立即唤醒一帧，让它至少绘制一次到当前位置。
         this.requestFrame();
       }
@@ -892,8 +909,10 @@ class GlobalCursorManager {
         this.ctx.globalAlpha = bodyAlpha;
         // 飞行中允许穿越其他窗格（否则动画会被邻居窗格"咬"断一截）；接近
         // 目标进入停留态时再启用 clip，避免阴影从边缘溢出到别的窗格。
+        // dying 分支不传 bbox（null），永远走 clip 路径——dying 的绘制位置每帧
+        // 变化，算 bbox 的代价接近 clip 本身，剪枝无收益。
         const flying = dist > CLIP_DISTANCE_THRESHOLD;
-        const animating = this.runWithEditorClip(data.editor, flying, () =>
+        const animating = this.runWithEditorClip(data.editor, flying, null, () =>
           data.instance.updateLoopLogic(this.isScrolling, true)
         );
         this.ctx.restore();
@@ -944,6 +963,25 @@ class GlobalCursorManager {
       return false;
     }
 
+    // 快路径：dirty=false 表示上次同步后位置/尺寸没变过（style observer 没
+    // 触发、也没被 scroll/focus/resize/interval 标脏）。直接用缓存的
+    // lastX/lastY，跳过 getBoundingClientRect 和后续 move 判定——spring 动画
+    // 仍然通过 updateLoopLogic 继续跑（比如从上一次 move 触发的 spring 还没
+    // 收敛，或者本体 alpha 还在淡出）。
+    if (!data.dirty) {
+      const flying = instance.getDistanceToDestination() > CLIP_DISTANCE_THRESHOLD;
+      const bbox = {
+        left: data.lastX - shadowBlur,
+        top: data.lastY - shadowBlur,
+        right: data.lastX + data.lastWidth + shadowBlur,
+        bottom: data.lastY + data.lastHeight + shadowBlur,
+      };
+      return this.runWithEditorClip(data.editor, flying, bbox, () =>
+        instance.updateLoopLogic(this.isScrolling, true)
+      );
+    }
+    data.dirty = false;
+
     const rect = target.getBoundingClientRect();
     // 布局尚未稳定时 rect 可能是 (0,0,0,0)：不能让这类值污染 lastX/lastY，
     // 否则 pickEditorAnchor 会把 (0,0) 作为跨窗格切换的起点，让下一个焦点
@@ -981,7 +1019,15 @@ class GlobalCursorManager {
     // 邻居窗格的内容里；飞行途中（跨窗格切换的动画中段）临时放开 clip，让
     // 光标可以穿越其他窗格，否则动画会被邻居窗格咬掉一段看起来断开了。
     const flying = instance.getDistanceToDestination() > CLIP_DISTANCE_THRESHOLD;
-    return this.runWithEditorClip(data.editor, flying, () =>
+    // 计算光标 + shadow 的外扩 bbox（CSS 像素），供 runWithEditorClip 做相交
+    // 剪枝：不与任何需挖矩形相交时可以完全跳过 save/rect/clip/restore。
+    const bbox = {
+      left: data.lastX - shadowBlur,
+      top: data.lastY - shadowBlur,
+      right: data.lastX + data.lastWidth + shadowBlur,
+      bottom: data.lastY + data.lastHeight + shadowBlur,
+    };
+    return this.runWithEditorClip(data.editor, flying, bbox, () =>
       instance.updateLoopLogic(this.isScrolling, !isOffScreen)
     );
   }
@@ -994,8 +1040,13 @@ class GlobalCursorManager {
   // 用 evenodd 填充规则实现"外框减去内框"的环形 clip。飞行途中（flying=true）
   // 完全跳过 clip，让光标穿越任何东西（包括 sticky 和面包屑）——因为路径中段
   // 本来就跨在多个窗格上，飞越视觉上更自然。
-  runWithEditorClip(editor, flying, fn) {
+  //
+  // 相交剪枝：bbox 给出光标+shadow 的外扩矩形；如果它不与任何需挖矩形相交，
+  // clip 只是空操作，直接跳过整套 save/rect/clip/restore。单光标 + 无分屏 +
+  // 光标远离 sticky/breadcrumb 时这个分支覆盖大多数帧。传 null 视为不做剪枝。
+  runWithEditorClip(editor, flying, bbox, fn) {
     if (flying) return fn();
+    if (bbox && !this._bboxNeedsClip(editor, bbox)) return fn();
     this.ctx.save();
     this.ctx.beginPath();
     // 外框：整块 canvas（CSS 像素）。所有绘制默认落在这里。
@@ -1021,6 +1072,23 @@ class GlobalCursorManager {
     } finally {
       this.ctx.restore();
     }
+  }
+
+  // 判断当前光标 bbox（left/top/right/bottom）是否与任何"需挖矩形"相交。
+  // 相交 = clip 会真实生效，需要走 clip 路径；不相交 = clip 是空操作，跳过。
+  _bboxNeedsClip(editor, bbox) {
+    const cache = this._getFrameEditorRects();
+    for (const entry of cache.editors) {
+      if (entry.editor === editor) continue;
+      const b = entry.rect;
+      if (bbox.left < b.right && bbox.right > b.left
+          && bbox.top < b.bottom && bbox.bottom > b.top) return true;
+    }
+    for (const b of cache.overlays) {
+      if (bbox.left < b.right && bbox.right > b.left
+          && bbox.top < b.bottom && bbox.bottom > b.top) return true;
+    }
+    return false;
   }
 
   _getFrameEditorRects() {
