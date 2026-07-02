@@ -45,39 +45,14 @@ const helperCanvas = document.createElement("canvas");
 const helperCtx = helperCanvas.getContext("2d");
 
 function resolveColor(color) {
+  // 用 Canvas 像素读取方式解析任意 CSS 颜色格式（hex/rgb/rgba/命名颜色），
+  // 避免 CSS 变量值或 computedStyle 为非 hex 时 fallback 到白色。
+  helperCtx.clearRect(0, 0, 1, 1);
   helperCtx.fillStyle = color;
-  const normalized = helperCtx.fillStyle;
-  return parseHexColor(normalized);
-}
-
-function parseHexColor(color) {
-  if (!color?.startsWith("#")) return { r: 255, g: 255, b: 255, a: 255 };
-  const hex = color.slice(1);
-  if (hex.length === 3) {
-    return {
-      r: parseInt(hex[0] + hex[0], 16),
-      g: parseInt(hex[1] + hex[1], 16),
-      b: parseInt(hex[2] + hex[2], 16),
-      a: 255
-    };
-  }
-  if (hex.length === 6) {
-    return {
-      r: parseInt(hex.slice(0, 2), 16),
-      g: parseInt(hex.slice(2, 4), 16),
-      b: parseInt(hex.slice(4, 6), 16),
-      a: 255
-    };
-  }
-  if (hex.length === 8) {
-    return {
-      a: parseInt(hex.slice(0, 2), 16),
-      r: parseInt(hex.slice(2, 4), 16),
-      g: parseInt(hex.slice(4, 6), 16),
-      b: parseInt(hex.slice(6, 8), 16)
-    };
-  }
-  return { r: 255, g: 255, b: 255, a: 255 };
+  helperCtx.fillRect(0, 0, 1, 1);
+  const pixel = helperCtx.getImageData(0, 0, 1, 1).data;
+  helperCtx.clearRect(0, 0, 1, 1);
+  return { r: pixel[0], g: pixel[1], b: pixel[2], a: pixel[3] };
 }
 
 function rgbaToCss({ r, g, b, a }) {
@@ -135,13 +110,14 @@ class Corner {
     this.animationX = new DampedSpringAnimation();
     this.animationY = new DampedSpringAnimation();
     this.animationLength = ANIMATION_SETTINGS.animationLength;
+    // getDestination / update 共用：避免每帧/每次移动都分配新 {x,y} 对象。
+    this._dest = { x: 0, y: 0 };
   }
 
   getDestination(center, cursorDimensions) {
-    return {
-      x: center.x + this.relativePosition.x * cursorDimensions.width,
-      y: center.y + this.relativePosition.y * cursorDimensions.height
-    };
+    this._dest.x = center.x + this.relativePosition.x * cursorDimensions.width;
+    this._dest.y = center.y + this.relativePosition.y * cursorDimensions.height;
+    return this._dest;
   }
 
   calculateDirectionAlignment(cursorDimensions, destination) {
@@ -188,11 +164,13 @@ class Corner {
         this.animationX.position = delta.x;
         this.animationY.position = delta.y;
       }
-      this.previousDestination = { ...cornerDestination };
+      this.previousDestination.x = cornerDestination.x;
+      this.previousDestination.y = cornerDestination.y;
     }
 
     if (immediate) {
-      this.currentPosition = cornerDestination;
+      this.currentPosition.x = cornerDestination.x;
+      this.currentPosition.y = cornerDestination.y;
       this.animationX.reset();
       this.animationY.reset();
       return false;
@@ -201,10 +179,8 @@ class Corner {
     const animX = this.animationX.update(dt, this.animationLength);
     const animY = this.animationY.update(dt, this.animationLength);
 
-    this.currentPosition = {
-      x: cornerDestination.x - this.animationX.position,
-      y: cornerDestination.y - this.animationY.position
-    };
+    this.currentPosition.x = cornerDestination.x - this.animationX.position;
+    this.currentPosition.y = cornerDestination.y - this.animationY.position;
     return animX || animY;
   }
 }
@@ -950,9 +926,15 @@ class GlobalCursorManager {
 
     // 每帧刷新当前活跃窗格的锚点位置，让跨窗格切换的动画起点始终跟随最近
     // 一次光标移动，而不是停留在首次聚焦时的旧位置。
-    if (this.lastActiveEditor && this.lastActiveEditor.isConnected) {
-      const anchor = this.pickEditorAnchor(this.lastActiveEditor);
-      if (anchor) this.lastActiveCursorPos = anchor;
+    if (this.lastActiveEditor) {
+      if (this.lastActiveEditor.isConnected) {
+        const anchor = this.pickEditorAnchor(this.lastActiveEditor);
+        if (anchor) this.lastActiveCursorPos = anchor;
+      } else {
+        // 编辑器标签页已关闭，释放 DOM 引用防止内存泄漏。
+        this.lastActiveEditor = null;
+        this.lastActiveCursorPos = null;
+      }
     }
 
     // Monaco 使用程序化滚动（CSS transform），不触发浏览器 scroll 事件。
@@ -961,6 +943,8 @@ class GlobalCursorManager {
     if (this._idleCheckId == null && this.cursors.size > 0) {
       this._idleCheckId = setTimeout(() => {
         this._idleCheckId = null;
+        // 回调执行前所有光标可能已被移除，避免空转一帧只做 clearRect。
+        if (this.cursors.size === 0) return;
         for (const data of this.cursors.values()) data.dirty = true;
         this.requestFrame();
       }, 33);
