@@ -179,12 +179,15 @@ class Corner {
     const cornerDestination = this.getDestination(destination, cursorDimensions);
 
     if (cornerDestination.x !== this.previousDestination.x || cornerDestination.y !== this.previousDestination.y) {
-      const delta = {
-        x: cornerDestination.x - this.currentPosition.x,
-        y: cornerDestination.y - this.currentPosition.y
-      };
-      this.animationX.position = delta.x;
-      this.animationY.position = delta.y;
+      // 滚动瞬移时 delta 算完立刻被下面的 reset() 归零——省掉无用的计算和赋值。
+      if (!immediate) {
+        const delta = {
+          x: cornerDestination.x - this.currentPosition.x,
+          y: cornerDestination.y - this.currentPosition.y
+        };
+        this.animationX.position = delta.x;
+        this.animationY.position = delta.y;
+      }
       this.previousDestination = { ...cornerDestination };
     }
 
@@ -460,10 +463,15 @@ function createNeovideCursor(options) {
     const immediateMovement = isScrolling;
 
     if (jumped) {
-      const ranks = computeCornerRanks(corners, cursorDimensions, centerDestination);
-      corners.forEach((corner, index) => {
-        corner.jump(centerDestination, cursorDimensions, ranks[index]);
-      });
+      // 滚动中 corner.update(immediate=true) 会在后面直接瞬移并重置弹簧，
+      // jump() 设置的 animationLength 和弹簧归零完全被覆盖——跳过角排名和
+      // jump 省掉每帧 4 次 calculateDirectionAlignment 的无用计算。
+      if (!immediateMovement) {
+        const ranks = computeCornerRanks(corners, cursorDimensions, centerDestination);
+        corners.forEach((corner, index) => {
+          corner.jump(centerDestination, cursorDimensions, ranks[index]);
+        });
+      }
       // 新动画启动的瞬间硬切到不透明，避免从"停留态透明"渐入 1 时，飞行途中
       // 拖尾本体几乎看不见（只剩 shadow 拖尾）。停下时才走指数淡出。
       currentBodyAlpha = 1;
@@ -516,6 +524,10 @@ class GlobalCursorManager {
     // requestFrame() 唤醒 loop；loop() 结束时若还有 animating 光标，也会
     // 自己 requestFrame() 续下一帧。空闲态整个 rAF 队列静默，CPU 降到 ~0。
     this._rafId = null;
+    // 空闲态位置轮询：VS Code 的 Monaco 使用程序化滚动不触发浏览器 scroll
+    // 事件，loop 空闲后无法被外部事件唤醒。此定时器以 50ms 间隔自唤醒，
+    // 确保光标位置始终与 DOM 同步。
+    this._idleCheckId = null;
     // 本帧 editor rect 缓存：runWithEditorClip 首次访问时 populate，同帧内
     // 所有光标复用，避免 N·M 次 querySelectorAll + getBoundingClientRect。
     // loop() 开头置为 null；每帧结束自然回收。
@@ -550,6 +562,9 @@ class GlobalCursorManager {
       clearTimeout(this.scrollTimeout);
       this.scrollTimeout = setTimeout(() => {
         this.isScrolling = false;
+        // 滚动结束后强制重读所有光标的位置，杜绝最后一帧的残留过期坐标。
+        for (const data of this.cursors.values()) data.dirty = true;
+        this.requestFrame();
       }, 100);
       // 滚动会移动光标的屏幕坐标但不改 .cursor 的 style（transform 是编辑器
       // 内容层做的），style observer 捕捉不到——必须显式标脏。
@@ -754,6 +769,7 @@ class GlobalCursorManager {
       editorGroups.get(editor).push(data);
     }
 
+    const editorsWithNewCursors = new Set();
     cursorElements.forEach((target) => {
       let cursorId = target.getAttribute("custom-cursor-id");
       if (!cursorId) {
@@ -815,12 +831,12 @@ class GlobalCursorManager {
           lastHeight: rect.height,
           createdAt: ++this.creationCounter,
           dying: false,
-          // dirty 标记：true 表示 updateCursor 需要重读 rect（位置/尺寸可能变了）。
-          // style observer 触发时置 true；updateCursor 消费后清零。稳态帧
-          // dirty=false 直接跳过 getBoundingClientRect，节省布局开销。
           dirty: true,
           observer: null,
         };
+        // 记录同窗格有新光标注册——后续移除检查时，若发现旧光标所在窗格
+        // 已有新光标，说明是 Monaco 重建 DOM 而非真正退出多光标，直接删除即可。
+        if (data.editor) editorsWithNewCursors.add(data.editor);
         // observer 需要引用 data 来置 dirty，所以要在 data 创建后再挂。
         data.observer = this._observeCursorTarget(target, data);
         this.cursors.set(cursorId, data);
@@ -832,10 +848,14 @@ class GlobalCursorManager {
     for (const [id, data] of this.cursors) {
       if (nowIds.has(id)) continue;
       if (data.dying) continue;
-      // DOM 被移除的光标（例如 Esc 退出多光标模式时销毁的次光标）不立刻删除，
-      // 而是标记为 dying 并给它设置一个"吸回主光标"的目的地，让 spring 动画
-      // 把它拉过去，产生被吸附的视觉效果。找不到吸附目标（例如整个窗格都消
-      // 失）时直接删除。
+      // 滚动期间 Monaco 可能移除/重建 .cursor DOM 而非原地移动它，此时不应
+      // 播放"吸回"动画——那会在旧位置留下孤儿光晕然后弹簧拖尾。直接删除即可。
+      // 同理，若同一扫描周期内同窗格已有新光标注册，说明这是替换而非真正的
+      // 多光标退出，也直接删除。
+      if (this.isScrolling || editorsWithNewCursors.has(data.editor)) {
+        this._removeCursor(id);
+        continue;
+      }
       const suckTarget = this.findSuckTarget(data);
       if (!suckTarget) {
         this._removeCursor(id);
@@ -925,14 +945,18 @@ class GlobalCursorManager {
       }
       // DOM 节点被移除但还未走到 scanCursors 的兜底路径（例如 loop 早于下一次
       // scan 触发）：这里不再直接 delete，先启动吸回动画，找不到吸附目标时才
-      // 真正丢弃。
+      // 真正丢弃。滚动期间 DOM 移除是 Monaco 重建元素导致的，直接删除不播放动画。
       if (!data.target.isConnected) {
-        const suckTarget = this.findSuckTarget(data);
-        if (suckTarget) {
-          this.startDying(data, suckTarget);
-          anyAnimating = true;
-        } else {
+        if (this.isScrolling) {
           this._removeCursor(id);
+        } else {
+          const suckTarget = this.findSuckTarget(data);
+          if (suckTarget) {
+            this.startDying(data, suckTarget);
+            anyAnimating = true;
+          } else {
+            this._removeCursor(id);
+          }
         }
         continue;
       }
@@ -946,7 +970,18 @@ class GlobalCursorManager {
       if (anchor) this.lastActiveCursorPos = anchor;
     }
 
-    // 有动画未收敛就续下一帧；全部收敛就把 rAF 停下，等外部事件唤醒。
+    // 空闲位置轮询：VS Code 的 Monaco 使用程序化滚动不触发浏览器 scroll
+    // 事件。无论动画是否在跑，每 50ms 标脏一次强制下帧读 DOM，确保光标目标
+    // 始终与真实位置同步。动画跑着时 requestFrame() 是 no-op（_rafId 已设），
+    // 但 dirty 标记会在当前动画帧的下一次 rAF 中触发位置重读。
+    if (this._idleCheckId == null) {
+      this._idleCheckId = setTimeout(() => {
+        this._idleCheckId = null;
+        for (const data of this.cursors.values()) data.dirty = true;
+        this.requestFrame();
+      }, 50);
+    }
+    // 有动画未收敛就续下一帧
     if (anyAnimating) this.requestFrame();
   }
 
@@ -972,7 +1007,7 @@ class GlobalCursorManager {
     // 可见性用缓存：Monaco 会单独把 .cursor 做透明（选区 anchor、闪烁、pending
     // 状态），此时 rect 仍有效但节点不应绘制——不然本体透明只剩 shadow，就
     // 会看到"凭空的光晕"。
-    if (!data.dirty) {
+    if (!data.dirty && !this.isScrolling) {
       if (data.hidden) return false;
       const flying = instance.getDistanceToDestination() > CLIP_DISTANCE_THRESHOLD;
       // shadow 外扩用 shadowBlur*2：canvas 高斯模糊的实际影响范围远大于
