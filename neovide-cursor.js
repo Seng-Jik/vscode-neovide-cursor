@@ -523,7 +523,15 @@ class GlobalCursorManager {
     const { instance, target } = data;
 
     const computed = getComputedStyle(target);
-    if (computed.visibility === "hidden" || computed.display === "none" || computed.opacity === "0") {
+    if (computed.visibility === "hidden" || computed.display === "none" || parseFloat(computed.opacity) < 0.05) {
+      return;
+    }
+
+    // 窗格失焦后 Monaco 会给 .cursor 做 opacity 淡出过渡，同时移除父级
+    // .monaco-editor 上的 focused 类。仅靠 opacity 判断会读到 "0.6" 这类
+    // 中间值，导致淡出期间光标继续被绘制，产生切换窗格时的短暂残留。
+    const editor = target.closest(".monaco-editor");
+    if (editor && !editor.classList.contains("focused")) {
       return;
     }
 
