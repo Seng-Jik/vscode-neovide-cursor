@@ -492,6 +492,10 @@ class GlobalCursorManager {
     // getComputedStyle。改为 focusout/focusin 事件维护 focusedEditor，
     // updateCursor 只做引用比较。
     this._focusedEditor = document.querySelector(".monaco-editor.focused");
+    // 高频返回值的可变缓存：避免每帧分配 {x,y} / {left,top,right,bottom}。
+    this._anchorPos = { x: 0, y: 0 };
+    this._bbox = { left: 0, top: 0, right: 0, bottom: 0 };
+    this._cursorIdCounter = 0;
     this.init();
   }
 
@@ -626,7 +630,9 @@ class GlobalCursorManager {
       if (!best || data.createdAt > best.createdAt) best = data;
     }
     if (!best) return null;
-    return { x: best.lastX, y: best.lastY };
+    this._anchorPos.x = best.lastX;
+    this._anchorPos.y = best.lastY;
+    return this._anchorPos;
   }
 
   // 直接从 DOM 读当前 focused 编辑器里的"主光标"实时位置，作为动画起点的
@@ -702,6 +708,8 @@ class GlobalCursorManager {
   }
 
   scanCursors() {
+    // 页面隐藏时 getBoundingClientRect 返回零值，扫描无意义且会误标脏。
+    if (document.hidden) return;
     const nowIds = new Set();
     const cursorElements = document.querySelectorAll(".monaco-editor .cursor");
 
@@ -723,7 +731,7 @@ class GlobalCursorManager {
     cursorElements.forEach((target) => {
       let cursorId = target.getAttribute("custom-cursor-id");
       if (!cursorId) {
-        cursorId = Math.random().toString(36).substring(7);
+        cursorId = "c" + (++this._cursorIdCounter);
         target.setAttribute("custom-cursor-id", cursorId);
       }
       nowIds.add(cursorId);
@@ -1036,12 +1044,11 @@ class GlobalCursorManager {
   // 的实际影响范围远大于 shadowBlur，尾部像素能延伸到 ~2 倍处）。
   _makeBbox(data) {
     const pad = shadowBlur * 2;
-    return {
-      left: data.lastX - pad,
-      top: data.lastY - pad,
-      right: data.lastX + data.lastWidth + pad,
-      bottom: data.lastY + data.lastHeight + pad,
-    };
+    this._bbox.left = data.lastX - pad;
+    this._bbox.top = data.lastY - pad;
+    this._bbox.right = data.lastX + data.lastWidth + pad;
+    this._bbox.bottom = data.lastY + data.lastHeight + pad;
+    return this._bbox;
   }
 
   // 允许 dying / 跨窗格切换过程中的光标穿越 tab bar 和窗格之间的间隙，但不
