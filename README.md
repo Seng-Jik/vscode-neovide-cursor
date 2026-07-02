@@ -24,6 +24,18 @@ This project is an open-source implementation inspired by the community.
 *   **Original Idea & Logic**: Based on the Reddit post by **u/qwreey**: [I made neovide alike cursor effect on vscode](https://www.reddit.com/r/vscode/comments/11e66xh/i_made_neovide_alike_cursor_effect_on_vscode/).
 *   **Refactoring & Fixes**: Includes significant rewrites for split-screen support, scroll synchronization, and global event management.
 
+## Seng Jik 的改进
+
+改进完全使用 Claude Sonnet 完成。
+
+* 多光标支持
+  * 创建多光标时新光标从旧光标飞入
+  * 删除多光标时将亡光标会飞回主光标
+* 在窗格间切换时光标可以飞越窗格
+* 修复特定情况下从左上角飞入的bug
+* 在涉及中文排版时坐标对不齐的问题
+* 光标停留时半透明化，避免遮挡下方字符与真实光标
+
 ## 🛠️ Installation
 
 To use this script, you need an extension that allows injecting custom JavaScript into VS Code.
@@ -50,6 +62,8 @@ const cursorUpdatePollingRate = 500; // dom detecting time (ms)
 const useShadow = true; // cursor shadow
 const shadowColor = cursorColor; // cursor shadow color
 const shadowBlur = 10; // shadow blur radius
+
+const stationaryBodyAlpha = 0.35; // 静止态（spring 收敛后）本体透明度，0 = 全透，1 = 不透明
 
 const ANIMATION_SETTINGS = {
   animationLength: 0.10, // animation time length (when cursor jumping)
