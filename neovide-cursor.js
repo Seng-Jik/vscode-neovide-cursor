@@ -260,7 +260,9 @@ function createNeovideCursor(options) {
   // 的 shadowAlphaFactor 靠 drawImage 时的 globalAlpha 处理（高斯模糊是线性
   // 算子，等价于对 sprite 整体缩放 alpha）。
   let shadowSprite = null;
-  let shadowSpriteInset = 0;  // sprite 内部矩形距 sprite 边缘的空白（等于 shadowBlur*2）
+  let shadowSpriteInset = 0;  // sprite 内部矩形距 sprite 边缘的空白（CSS 像素，等于 shadowBlur*2）
+  let shadowSpriteCssWidth = 0;
+  let shadowSpriteCssHeight = 0;
 
   const corners = STANDARD_CORNERS.map(rel => new Corner(rel));
 
@@ -271,10 +273,18 @@ function createNeovideCursor(options) {
     if (w <= 0 || h <= 0) { shadowSprite = null; return; }
     // 留出 blur 半径 × 2 的边距，保证软阴影不被裁掉。
     const pad = shadowBlur * 2;
+    const cssW = w + pad * 2;
+    const cssH = h + pad * 2;
+    // sprite 内部按 devicePixelRatio 扩容，保证在 Retina/高 DPI 屏上光晕不
+    // 模糊。setTransform 让后续 fillRect 继续用 CSS 坐标；drawImage 时通过
+    // 9-arg 明确目标 CSS 尺寸，不然默认会按物理像素当 CSS 尺寸画，位置对但
+    // 内部像素密度只有 1x。
+    const dpr = window.devicePixelRatio || 1;
     const sprite = document.createElement("canvas");
-    sprite.width = Math.ceil(w + pad * 2);
-    sprite.height = Math.ceil(h + pad * 2);
+    sprite.width = Math.ceil(cssW * dpr);
+    sprite.height = Math.ceil(cssH * dpr);
     const sctx = sprite.getContext("2d");
+    sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     // 在 sprite 中心画矩形，触发 shadow，再用 destination-out 擦掉本体，只留光晕。
     sctx.shadowColor = rgbaToCss(shadowColorObj);
     sctx.shadowBlur = shadowBlur;
@@ -287,6 +297,8 @@ function createNeovideCursor(options) {
     sctx.fillRect(pad, pad, w, h);
     shadowSprite = sprite;
     shadowSpriteInset = pad;
+    shadowSpriteCssWidth = cssW;
+    shadowSpriteCssHeight = cssH;
   }
 
   function updateCursorSize(width, height) {
@@ -333,13 +345,17 @@ function createNeovideCursor(options) {
 
     if (useSprite && shadowSprite && useShadow && shadowAlphaFactor > 0) {
       // 停留态：spring 已收敛，corners 就在原始矩形位置。用 corners[0]（左上）
-      // 作为定位锚点，扣除 sprite 的内边距即可。
+      // 作为定位锚点，扣除 sprite 的内边距即可。9-arg drawImage 明确目标 CSS
+      // 尺寸——sprite 内部是物理像素，直接 3-arg drawImage 会用物理像素当 CSS
+      // 尺寸导致光晕放大且模糊。
       context.save();
       context.globalAlpha = context.globalAlpha * shadowAlphaFactor;
       context.drawImage(
         shadowSprite,
+        0, 0, shadowSprite.width, shadowSprite.height,
         corners[0].currentPosition.x - shadowSpriteInset,
-        corners[0].currentPosition.y - shadowSpriteInset
+        corners[0].currentPosition.y - shadowSpriteInset,
+        shadowSpriteCssWidth, shadowSpriteCssHeight
       );
       context.restore();
     } else if (useShadow && shadowAlphaFactor > 0) {
@@ -918,10 +934,13 @@ class GlobalCursorManager {
     const { instance, target } = data;
 
     // 窗格未 focused（Monaco 会在失焦后对 .cursor 做 opacity 淡出，此期间
-    // 还会绘制若干帧）：直接跳过，不占用绘制。原来靠 getComputedStyle 判定
-    // 每帧强制样式重算；改为 focusin/focusout 事件维护 _focusedEditor，
-    // 引用比较即可。
-    if (data.editor && data.editor !== this._focusedEditor) {
+    // 还会绘制若干帧）：直接跳过，不占用绘制。
+    // 快路径：focusin/focusout 事件维护的 _focusedEditor 做引用比较；慢路径：
+    // classList 兜底——首帧或 script 注入时机早于用户第一次 focus 时
+    // _focusedEditor 可能仍为 null，但 Monaco 自己一直在维护 focused 类，
+    // 靠 classList 就能确保光标始终能被绘制。classList 属性访问不触发布局。
+    if (data.editor && data.editor !== this._focusedEditor
+        && !data.editor.classList.contains("focused")) {
       return false;
     }
 
@@ -968,24 +987,32 @@ class GlobalCursorManager {
   }
 
   // 允许 dying / 跨窗格切换过程中的光标穿越 tab bar 和窗格之间的间隙，但不
-  // 允许盖到其他窗格的内容区。做法：clip 掉"所有其他 .monaco-editor 的矩形"，
-  // 保留整块画布的剩余部分——即当前 editor 本身、标题栏、编辑器之间的空隙。
+  // 允许盖到其他窗格的内容区，也不允许停留在 sticky scroll 悬浮栏或面包屑
+  // 导航栏下（否则动画光标会被这些悬浮层遮挡时序不同步，出现"半个光标露出
+  // 来"或位置错乱）。做法：clip 掉"所有其他 .monaco-editor 的矩形 +
+  // 所有 .sticky-widget + 所有 .monaco-breadcrumbs"，保留整块画布的剩余部分。
   // 用 evenodd 填充规则实现"外框减去内框"的环形 clip。飞行途中（flying=true）
-  // 完全跳过 clip，让光标穿越任何东西——因为路径中段本来就跨在多个窗格上。
+  // 完全跳过 clip，让光标穿越任何东西（包括 sticky 和面包屑）——因为路径中段
+  // 本来就跨在多个窗格上，飞越视觉上更自然。
   runWithEditorClip(editor, flying, fn) {
     if (flying) return fn();
     this.ctx.save();
     this.ctx.beginPath();
     // 外框：整块 canvas（CSS 像素）。所有绘制默认落在这里。
     this.ctx.rect(0, 0, window.innerWidth, window.innerHeight);
-    // 内框：每个"其他窗格"。evenodd 会把这些矩形从允许区里挖掉。
-    // 本帧缓存：多光标 / 多分屏时同一帧内所有光标共用一份 editor 列表，避免
-    // 重复 querySelectorAll 和 getBoundingClientRect。loop() 每帧开头把
-    // _frameEditorRects 置 null 触发下一次重建。
-    const rects = this._getFrameEditorRects();
-    for (const entry of rects) {
+    // 内框：每个"其他窗格" + 所有 sticky 栏 + 所有面包屑。evenodd 会把这些
+    // 矩形从允许区里挖掉。本帧缓存：多光标 / 多分屏时同一帧内所有光标共用一
+    // 份矩形列表，避免重复 querySelectorAll 和 getBoundingClientRect。
+    // loop() 每帧开头把 _frameEditorRects 置 null 触发下一次重建。
+    const cache = this._getFrameEditorRects();
+    for (const entry of cache.editors) {
       if (entry.editor === editor) continue;
       const b = entry.rect;
+      this.ctx.rect(b.left, b.top, b.width, b.height);
+    }
+    for (const b of cache.overlays) {
+      // sticky 栏和面包屑无论属于哪个 editor 都要挖：即使是当前 editor 自己的
+      // sticky/面包屑也不能让光标画在下面。
       this.ctx.rect(b.left, b.top, b.width, b.height);
     }
     this.ctx.clip("evenodd");
@@ -998,15 +1025,25 @@ class GlobalCursorManager {
 
   _getFrameEditorRects() {
     if (this._frameEditorRects) return this._frameEditorRects;
-    const editors = document.querySelectorAll(".monaco-editor");
-    const out = [];
-    for (const editor of editors) {
+    const editorNodes = document.querySelectorAll(".monaco-editor");
+    // 一起收集所有需要遮挡光标的悬浮层：sticky scroll 栏 + 面包屑。两者结构
+    // 上都是覆盖在编辑区上方的固定元素，clip 处理逻辑完全一致，合并到一个
+    // overlays 数组减少循环开销。
+    const overlayNodes = document.querySelectorAll(".sticky-widget, .monaco-breadcrumbs");
+    const editors = [];
+    for (const editor of editorNodes) {
       const rect = editor.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) continue;
-      out.push({ editor, rect });
+      editors.push({ editor, rect });
     }
-    this._frameEditorRects = out;
-    return out;
+    const overlays = [];
+    for (const s of overlayNodes) {
+      const rect = s.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      overlays.push(rect);
+    }
+    this._frameEditorRects = { editors, overlays };
+    return this._frameEditorRects;
   }
 }
 

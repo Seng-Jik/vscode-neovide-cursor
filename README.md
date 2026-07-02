@@ -24,17 +24,19 @@ This project is an open-source implementation inspired by the community.
 *   **Original Idea & Logic**: Based on the Reddit post by **u/qwreey**: [I made neovide alike cursor effect on vscode](https://www.reddit.com/r/vscode/comments/11e66xh/i_made_neovide_alike_cursor_effect_on_vscode/).
 *   **Refactoring & Fixes**: Includes significant rewrites for split-screen support, scroll synchronization, and global event management.
 
-## Seng Jik 的改进
+## Seng Jik 的改进 / Seng Jik's Improvements
 
 改进完全使用 Claude Sonnet 完成。
 
-* 多光标支持
-  * 创建多光标时新光标从旧光标飞入
-  * 删除多光标时将亡光标会飞回主光标
-* 在窗格间切换时光标可以飞越窗格
-* 修复特定情况下从左上角飞入的bug
-* 在涉及中文排版时坐标对不齐的问题
-* 光标停留时半透明化，避免遮挡下方字符与真实光标
+Improvements were done entirely with Claude Sonnet.
+
+* 多光标支持 / Multi-cursor support
+  * 创建多光标时新光标从旧光标飞入 / New cursors fly in from existing ones when multi-cursor is triggered
+  * 删除多光标时将亡光标会飞回主光标 / Dying cursors are sucked back into the primary cursor when multi-cursor mode exits
+* 在窗格间切换时光标可以飞越窗格 / Cursor can fly across panes when switching split editors
+* 修复特定情况下从左上角飞入的bug / Fixed a bug where the cursor sometimes flew in from the top-left corner
+* 在涉及中文排版时坐标对不齐的问题 / Fixed coordinate misalignment when mixing CJK and Latin characters
+* 光标停留时半透明化，避免遮挡下方字符与真实光标 / Cursor fades to semi-transparent when stationary, so the underlying character and the real cursor stay visible
 
 ## 🛠️ Installation
 
