@@ -716,15 +716,16 @@ class GlobalCursorManager {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
-  // 给 .cursor 挂 style 属性 observer：Monaco 只在真正移位时改 style，
-  // 这就相当于"光标移动事件"。触发时唤醒一帧并把光标标记为脏，让 updateCursor
-  // 重读 rect；稳态帧 dirty=false 可以完全跳过 getBoundingClientRect。
+  // 给 .cursor 挂属性 observer：Monaco 通过改 style（移位、闪烁）或改 class
+  // （选区/pending 状态）来更新光标；两种情况都当作"位置或可见性变了"处理，
+  // 唤醒一帧并把光标标脏，让 updateCursor 重读 rect 和 computedStyle。稳态
+  // 帧 dirty=false 可以完全跳过 getBoundingClientRect + getComputedStyle。
   _observeCursorTarget(target, data) {
     const obs = new MutationObserver(() => {
       data.dirty = true;
       this.requestFrame();
     });
-    obs.observe(target, { attributes: true, attributeFilter: ["style"] });
+    obs.observe(target, { attributes: true, attributeFilter: ["style", "class"] });
     return obs;
   }
 
@@ -968,19 +969,39 @@ class GlobalCursorManager {
     // lastX/lastY，跳过 getBoundingClientRect 和后续 move 判定——spring 动画
     // 仍然通过 updateLoopLogic 继续跑（比如从上一次 move 触发的 spring 还没
     // 收敛，或者本体 alpha 还在淡出）。
+    // 可见性用缓存：Monaco 会单独把 .cursor 做透明（选区 anchor、闪烁、pending
+    // 状态），此时 rect 仍有效但节点不应绘制——不然本体透明只剩 shadow，就
+    // 会看到"凭空的光晕"。
     if (!data.dirty) {
+      if (data.hidden) return false;
       const flying = instance.getDistanceToDestination() > CLIP_DISTANCE_THRESHOLD;
+      // shadow 外扩用 shadowBlur*2：canvas 高斯模糊的实际影响范围远大于
+      // shadowBlur（后者只是"模糊半径"，尾部像素能延伸到 ~2 倍处），与
+      // rebuildShadowSprite 里的 pad 保持一致。用 shadowBlur 会低估，光标离
+      // sticky/breadcrumb/邻居窗格 20~40px 时相交剪枝误判为不相交，shadow
+      // 就溢出到本该被 clip 挖掉的区域。
+      const shadowPad = shadowBlur * 2;
       const bbox = {
-        left: data.lastX - shadowBlur,
-        top: data.lastY - shadowBlur,
-        right: data.lastX + data.lastWidth + shadowBlur,
-        bottom: data.lastY + data.lastHeight + shadowBlur,
+        left: data.lastX - shadowPad,
+        top: data.lastY - shadowPad,
+        right: data.lastX + data.lastWidth + shadowPad,
+        bottom: data.lastY + data.lastHeight + shadowPad,
       };
       return this.runWithEditorClip(data.editor, flying, bbox, () =>
         instance.updateLoopLogic(this.isScrolling, true)
       );
     }
     data.dirty = false;
+
+    // dirty 分支必查一次可见性：Monaco 通过 CSS 类或 inline style 把光标做
+    // 透明/隐藏时不会改坐标，若只依赖 rect 会漏掉，导致 stationaryBodyAlpha=0
+    // 场景下留下"孤儿光晕"。getComputedStyle 只在 dirty 时调，频率与
+    // style observer 触发一致（远低于 60Hz）。
+    const computed = getComputedStyle(target);
+    data.hidden = computed.visibility === "hidden"
+      || computed.display === "none"
+      || parseFloat(computed.opacity) < 0.05;
+    if (data.hidden) return false;
 
     const rect = target.getBoundingClientRect();
     // 布局尚未稳定时 rect 可能是 (0,0,0,0)：不能让这类值污染 lastX/lastY，
@@ -1021,11 +1042,13 @@ class GlobalCursorManager {
     const flying = instance.getDistanceToDestination() > CLIP_DISTANCE_THRESHOLD;
     // 计算光标 + shadow 的外扩 bbox（CSS 像素），供 runWithEditorClip 做相交
     // 剪枝：不与任何需挖矩形相交时可以完全跳过 save/rect/clip/restore。
+    // shadowPad 与 rebuildShadowSprite 保持一致，见上方快路径注释。
+    const shadowPad = shadowBlur * 2;
     const bbox = {
-      left: data.lastX - shadowBlur,
-      top: data.lastY - shadowBlur,
-      right: data.lastX + data.lastWidth + shadowBlur,
-      bottom: data.lastY + data.lastHeight + shadowBlur,
+      left: data.lastX - shadowPad,
+      top: data.lastY - shadowPad,
+      right: data.lastX + data.lastWidth + shadowPad,
+      bottom: data.lastY + data.lastHeight + shadowPad,
     };
     return this.runWithEditorClip(data.editor, flying, bbox, () =>
       instance.updateLoopLogic(this.isScrolling, !isOffScreen)
