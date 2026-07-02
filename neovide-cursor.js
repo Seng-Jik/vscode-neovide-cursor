@@ -6,8 +6,7 @@ const shadowColor = cursorColor; // cursor shadow color
 const shadowBlur = 20; // shadow blur radius
 
 const ANIMATION_SETTINGS = {
-  animationLength: 0.15, // animation time length (when cursor jumping)
-  shortAnimationLength: 0.08, // short animation time length (when cursor moving on single line)
+  animationLength: 0.1, // animation time length (when cursor jumping)
   trailSize: 1, // animation trail density (0-1)
 };
 
@@ -139,26 +138,14 @@ class Corner {
   }
 
   jump(destination, cursorDimensions, rank) {
-    const target = this.getDestination(destination, cursorDimensions);
-    const jumpVec = {
-      x: (target.x - this.previousDestination.x) / cursorDimensions.width,
-      y: (target.y - this.previousDestination.y) / cursorDimensions.height
-    };
-
-    const isShortJump = Math.abs(jumpVec.x) <= 2.001 && Math.abs(jumpVec.y) <= 0.001;
-
-    if (isShortJump) {
-      this.animationLength = Math.min(ANIMATION_SETTINGS.animationLength, ANIMATION_SETTINGS.shortAnimationLength);
+    const leading = ANIMATION_SETTINGS.animationLength * clamp(1 - ANIMATION_SETTINGS.trailSize, 0, 1);
+    const trailing = ANIMATION_SETTINGS.animationLength;
+    if (rank >= 2) {
+      this.animationLength = leading;
+    } else if (rank === 1) {
+      this.animationLength = (leading + trailing) / 2;
     } else {
-      const leading = ANIMATION_SETTINGS.animationLength * clamp(1 - ANIMATION_SETTINGS.trailSize, 0, 1);
-      const trailing = ANIMATION_SETTINGS.animationLength;
-      if (rank >= 2) {
-        this.animationLength = leading;
-      } else if (rank === 1) {
-        this.animationLength = (leading + trailing) / 2;
-      } else {
-        this.animationLength = trailing;
-      }
+      this.animationLength = trailing;
     }
     this.animationX.reset();
     this.animationY.reset();
