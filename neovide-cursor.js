@@ -5,6 +5,13 @@ const useShadow = true; // cursor shadow
 const shadowColor = cursorColor; // cursor shadow color
 const shadowBlur = 20; // shadow blur radius
 
+// 光标停留在字符上时把本体 alpha 降到这个值，让下方字符和真实光标透出来。
+// 飞行中保持 1.0 以保留视觉冲击；判定"停留"以 spring 动画收敛为准。
+const stationaryBodyAlpha = 0;
+// 停留态本体 alpha 从 1 匀速淡到 stationaryBodyAlpha 所需的总时间（秒）。
+// 用线性淡出而非指数衰减，避免尾巴拖长；数值越小打字/定位体感越干脆。
+const bodyAlphaFadeDuration = 0.04;
+
 const ANIMATION_SETTINGS = {
   animationLength: 0.1, // animation time length (when cursor jumping)
   trailSize: 1, // animation trail density (0-1)
@@ -236,6 +243,10 @@ function createNeovideCursor(options) {
   // 独立于 globalAlpha 的阴影强度系数：dying 光标越靠近吸附目标时，两个光标
   // 的阴影会强烈重叠形成大面积光晕，需要按距离单独把阴影压下来。
   let shadowAlphaFactor = 1;
+  // 当前平滑逼近后的本体 alpha。目标值由 updateLoopLogic 每帧根据 animating
+  // 计算，实际渲染值走指数衰减，避免"停下瞬间"的硬跳变。初始 1 保证首次
+  // 飞入时不透明。
+  let currentBodyAlpha = 1;
 
   const corners = STANDARD_CORNERS.map(rel => new Corner(rel));
 
@@ -270,8 +281,16 @@ function createNeovideCursor(options) {
     }
   }
 
-  function drawCursorShape() {
+  function drawCursorShape(bodyAlpha = 1) {
     if (!initialized) return;
+
+    // 分两 pass 绘制以隔离 body alpha 和 shadow：
+    //   Pass 1 - 画阴影：用不透明 fill 让 canvas 生成 shadow，然后用
+    //            destination-out 把光标本体擦掉，只留下外围的 shadow 光晕。
+    //   Pass 2 - 画本体：按 bodyAlpha 半透明填充。
+    // canvas 的 shadow 强度是根据被绘制像素的 alpha 生成的，无法用透明 fill
+    // 直接"只画阴影"，所以走"画满再擦掉"的路子。
+
     context.beginPath();
     context.moveTo(corners[0].currentPosition.x, corners[0].currentPosition.y);
     for (let i = 1; i < corners.length; i++) {
@@ -279,13 +298,12 @@ function createNeovideCursor(options) {
     }
     context.closePath();
 
-    context.fillStyle = rgbaToCss(colorObj);
     context.imageSmoothingEnabled = ANIMATION_SETTINGS.antialiasing;
 
-    // canvas 的阴影强度由 shadowColor 的 alpha 直接控制；shadowAlphaFactor 让
-    // 调用方能独立压制光晕（例如 dying 光标靠近吸附目标时避免叠出大面积光晕），
-    // 又不影响本体填充的透明度。
+    // Pass 1: 阴影。不透明 fill 触发 shadow 渲染；shadowAlphaFactor 让调用方
+    // 独立压制光晕（dying 光标靠近吸附目标时用到）。
     if (useShadow && shadowAlphaFactor > 0) {
+      context.save();
       context.shadowColor = rgbaToCss({
         r: shadowColorObj.r,
         g: shadowColorObj.g,
@@ -293,11 +311,31 @@ function createNeovideCursor(options) {
         a: shadowColorObj.a * shadowAlphaFactor
       });
       context.shadowBlur = shadowBlur;
-    } else {
+      context.fillStyle = rgbaToCss(colorObj);
+      context.fill();
+      context.restore();
+
+      // 擦掉刚画上的本体，保留 shadow。destination-out 只影响 canvas 上已有
+      // 的像素，shadow 位于路径外围，不会被擦。
+      context.save();
+      context.globalCompositeOperation = "destination-out";
       context.shadowColor = "rgba(0, 0, 0, 0)";
       context.shadowBlur = 0;
+      context.fillStyle = "rgba(0, 0, 0, 1)";
+      context.fill();
+      context.restore();
     }
-    context.fill();
+
+    // Pass 2: 本体填充。关掉 shadow，body alpha 只影响这一层。
+    if (bodyAlpha > 0) {
+      context.save();
+      context.globalAlpha = context.globalAlpha * bodyAlpha;
+      context.shadowColor = "rgba(0, 0, 0, 0)";
+      context.shadowBlur = 0;
+      context.fillStyle = rgbaToCss(colorObj);
+      context.fill();
+      context.restore();
+    }
   }
 
   function setShadowAlphaFactor(factor) {
@@ -350,6 +388,9 @@ function createNeovideCursor(options) {
       corners.forEach((corner, index) => {
         corner.jump(centerDestination, cursorDimensions, ranks[index]);
       });
+      // 新动画启动的瞬间硬切到不透明，避免从"停留态透明"渐入 1 时，飞行途中
+      // 拖尾本体几乎看不见（只剩 shadow 拖尾）。停下时才走指数淡出。
+      currentBodyAlpha = 1;
     }
 
     let animating = false;
@@ -359,8 +400,25 @@ function createNeovideCursor(options) {
       }
     });
 
+    // body alpha 停留时线性淡到 stationaryBodyAlpha，起步即最快速度、到点即
+     // 停，不像指数衰减那样尾巴拖长。飞行中直接硬回 1（jumped 分支已处理）。
+    const targetBodyAlpha = animating ? 1 : stationaryBodyAlpha;
+    if (currentBodyAlpha !== targetBodyAlpha) {
+      const step = bodyAlphaFadeDuration > 0 ? dt / bodyAlphaFadeDuration : 1;
+      if (currentBodyAlpha > targetBodyAlpha) {
+        currentBodyAlpha = Math.max(targetBodyAlpha, currentBodyAlpha - step);
+      } else {
+        currentBodyAlpha = Math.min(targetBodyAlpha, currentBodyAlpha + step);
+      }
+      // 淡出未收敛也算 animating，驱动 loop 继续跑帧，否则 spring 一停 loop
+      // 也停，看不到淡出过程。
+      if (currentBodyAlpha !== targetBodyAlpha) animating = true;
+    }
+
     if (shouldDraw) {
-      drawCursorShape();
+      // dying 光标在到达吸附目标前 animating 恒为 true，本体一直是 1，外层
+      // globalAlpha 负责时间淡出；此处不干扰它。
+      drawCursorShape(currentBodyAlpha);
     }
 
     jumped = false;
