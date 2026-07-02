@@ -364,6 +364,51 @@ class GlobalCursorManager {
       }
     });
     observer.observe(document.body, { childList: true, subtree: true });
+
+    // 记录上一个活跃窗格里最近使用过的光标位置。当焦点切到别的 .monaco-editor
+    // 时（例如 Ctrl+1/2/3），把新窗格里所有已存在的光标从这个位置"飞"到当前
+    // 位置，产生跨窗格切换的动画。
+    this.lastActiveEditor = null;
+    this.lastActiveCursorPos = null;
+    document.addEventListener("focusin", (e) => this.handleFocusChange(e.target), true);
+  }
+
+  handleFocusChange(target) {
+    if (!target || !target.closest) return;
+    const editor = target.closest(".monaco-editor");
+    if (!editor) return;
+    if (editor === this.lastActiveEditor) return;
+
+    // 收集新窗格里的所有已注册光标，并把源位置作为动画起点。缺少源位置时
+    // （第一次聚焦）直接更新当前窗格，不放动画。
+    if (this.lastActiveCursorPos) {
+      for (const data of this.cursors.values()) {
+        if (!data.target.isConnected) continue;
+        if (data.target.closest(".monaco-editor") !== editor) continue;
+        const rect = data.target.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) continue;
+        data.instance.setPosition(this.lastActiveCursorPos.x, this.lastActiveCursorPos.y);
+        data.instance.move(rect.left, rect.top);
+        data.lastX = rect.left;
+        data.lastY = rect.top;
+      }
+    }
+
+    this.lastActiveEditor = editor;
+    // 更新一次源位置：取新窗格里"最近创建的那个光标"的当前位置，供下一次
+    // 切走时作为动画起点。
+    this.lastActiveCursorPos = this.pickEditorAnchor(editor);
+  }
+
+  pickEditorAnchor(editor) {
+    let best = null;
+    for (const data of this.cursors.values()) {
+      if (!data.target.isConnected) continue;
+      if (data.target.closest(".monaco-editor") !== editor) continue;
+      if (!best || data.createdAt > best.createdAt) best = data;
+    }
+    if (!best) return null;
+    return { x: best.lastX, y: best.lastY };
   }
 
   mutationHasCursor(nodeList) {
@@ -462,6 +507,13 @@ class GlobalCursorManager {
         continue;
       }
       this.updateCursor(data);
+    }
+
+    // 每帧刷新当前活跃窗格的锚点位置，让跨窗格切换的动画起点始终跟随最近
+    // 一次光标移动，而不是停留在首次聚焦时的旧位置。
+    if (this.lastActiveEditor && this.lastActiveEditor.isConnected) {
+      const anchor = this.pickEditorAnchor(this.lastActiveEditor);
+      if (anchor) this.lastActiveCursorPos = anchor;
     }
 
     requestAnimationFrame(() => this.loop());
