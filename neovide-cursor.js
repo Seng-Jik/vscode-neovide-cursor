@@ -15,6 +15,18 @@ const ANIMATION_SETTINGS = {
 // 是为了在阴影半径够小时不误判为飞行。
 const CLIP_DISTANCE_THRESHOLD = 30;
 
+// Monaco 的 .cursor 节点在刚插入 DOM、编辑器聚焦切换、tab 切换等瞬间会
+// 短暂给出 (0,0,0,0) 或坐标位于视口原点的 rect（此时 Monaco 还没跑完布局）。
+// 若把这类值当作真实位置缓存到 lastX/lastY，或当作动画目的地传给 move()，
+// 光标就会从画布左上角飞出。所有对 .cursor rect 的读取都要先过这个检查。
+// 编辑器内部的光标最少也在行号槽之后，rect.left/top 不可能真正落在 (0,0)。
+function isValidCursorRect(rect) {
+  if (!rect) return false;
+  if (rect.width <= 0 || rect.height <= 0) return false;
+  if (rect.left === 0 && rect.top === 0) return false;
+  return true;
+}
+
 // -----------------------
 
 const STANDARD_CORNERS = [
@@ -431,14 +443,18 @@ class GlobalCursorManager {
 
     // 收集新窗格里的所有已注册光标，并把源位置作为动画起点。缺少源位置时
     // （第一次聚焦）直接更新当前窗格，不放动画。
-    if (this.lastActiveCursorPos) {
+    const spawnPoint = this.resolveSpawnPoint(this.lastActiveCursorPos);
+    if (spawnPoint) {
       for (const data of this.cursors.values()) {
         if (data.dying) continue;
         if (!data.target.isConnected) continue;
         if (data.target.closest(".monaco-editor") !== editor) continue;
         const rect = data.target.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) continue;
-        data.instance.setPosition(this.lastActiveCursorPos.x, this.lastActiveCursorPos.y);
+        // 不能只判 width && height 为 0：Monaco 布局尚未完成时，rect 也可能
+        // 落在视口原点（一侧维度非零但坐标是 0,0），把这类值当动画终点会让
+        // 光标飞到左上角。isValidCursorRect 会同时挡掉这两类脏值。
+        if (!isValidCursorRect(rect)) continue;
+        data.instance.setPosition(spawnPoint.x, spawnPoint.y);
         data.instance.move(rect.left, rect.top);
         data.lastX = rect.left;
         data.lastY = rect.top;
@@ -461,6 +477,37 @@ class GlobalCursorManager {
     }
     if (!best) return null;
     return { x: best.lastX, y: best.lastY };
+  }
+
+  // 直接从 DOM 读当前 focused 编辑器里的"主光标"实时位置，作为动画起点的
+  // 最终兜底。所有基于缓存字段（lastX/lastY、lastActiveCursorPos）的推导都
+  // 可能因为异常路径变成 (0,0)——例如 Monaco 在极端 tab 切换时刻返回脏 rect、
+  // 缓存被写入无效值、或首次聚焦还没建立锚点。相比让光标飞去画布左上角，飞
+  // 出焦点窗格的主光标位置视觉上要合理得多。
+  //
+  // 主光标定义：focused 编辑器内第一个 rect 有效的 .cursor 节点。Monaco 的
+  // primary cursor 通常是最早插入 DOM 的那个，DOM 顺序天然对应"第一个"。
+  getActiveEditorPrimaryCursorPos() {
+    const focused = document.querySelector(".monaco-editor.focused");
+    if (!focused) return null;
+    const cursors = focused.querySelectorAll(".cursor");
+    for (const cursor of cursors) {
+      const rect = cursor.getBoundingClientRect();
+      if (isValidCursorRect(rect)) return { x: rect.left, y: rect.top };
+    }
+    return null;
+  }
+
+  // 校验一个准备用作动画起点的坐标：合法就原样返回；落在 (0,0) 附近或明显
+  // 越界则回退到当前 focused 编辑器的主光标位置。都拿不到时返回 null，让
+  // 调用方走"无动画直接就位"的分支——总之绝不允许把 (0,0) 传给 setPosition。
+  resolveSpawnPoint(candidate) {
+    if (candidate && isValidCursorRect({
+      left: candidate.x, top: candidate.y, width: 1, height: 1
+    })) {
+      return candidate;
+    }
+    return this.getActiveEditorPrimaryCursorPos();
   }
 
   mutationHasCursor(nodeList) {
@@ -504,8 +551,14 @@ class GlobalCursorManager {
       nowIds.add(cursorId);
 
       if (!this.cursors.has(cursorId)) {
-        const instance = createNeovideCursor({ canvas: this.canvas });
         const rect = target.getBoundingClientRect();
+        // 新光标 rect 无效时（Monaco 尚未跑完布局），本轮不注册。若强行把
+        // (0,0) 记进来，move() 会立刻把 spring 目标锁死在左上角，光标就会
+        // 先从合法起点飞到 (0,0) 再飞回真实位置。等下一次 MutationObserver
+        // 触发或 500ms 轮询触发时再重试。
+        if (!isValidCursorRect(rect)) return;
+
+        const instance = createNeovideCursor({ canvas: this.canvas });
         instance.updateCursorSize(rect.width, rect.height);
 
         // 只在同一 .monaco-editor 窗格内查找起点光标，按 createdAt 取最近
@@ -525,15 +578,11 @@ class GlobalCursorManager {
           spawnSource = { x: last.lastX, y: last.lastY };
         }
 
-        // 同窗格找不到兄弟光标时（例如新分屏里首次出现的光标，或者 DOM 刚插入
-        // 时兄弟光标的 rect 尚未稳定），退回到"当前活跃窗格的主光标位置"作为
-        // 动画起点，避免退化成从画布左上角 (0,0) 起飞的怪异动画。
-        if (!spawnSource) {
-          const activeEditor = document.querySelector(".monaco-editor.focused");
-          if (activeEditor) {
-            spawnSource = this.pickEditorAnchor(activeEditor);
-          }
-        }
+        // 同窗格找不到兄弟光标、或兄弟坐标脏（比如 lastX/lastY 恰好被写成
+        // (0,0)）时，交给 resolveSpawnPoint：它会先校验候选值合法性，不合法
+        // 就回退到当前 focused 编辑器主光标的实时位置，避免退化成从画布左上
+        // 角 (0,0) 起飞。
+        spawnSource = this.resolveSpawnPoint(spawnSource);
 
         if (spawnSource) {
           instance.setPosition(spawnSource.x, spawnSource.y);
@@ -682,6 +731,12 @@ class GlobalCursorManager {
     }
 
     const rect = target.getBoundingClientRect();
+    // 布局尚未稳定时 rect 可能是 (0,0,0,0)：不能让这类值污染 lastX/lastY，
+    // 否则 pickEditorAnchor 会把 (0,0) 作为跨窗格切换的起点，让下一个焦点
+    // 光标从左上角飞出。同样跳过尺寸更新——用 0 宽/高重算 centerDestination
+    // 会把动画目的地推到窗格原点。
+    if (!isValidCursorRect(rect)) return;
+
     const isOffScreen = rect.right < 0 || rect.bottom < 0 ||
       rect.left > window.innerWidth || rect.top > window.innerHeight;
 
