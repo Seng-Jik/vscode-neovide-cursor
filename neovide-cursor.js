@@ -55,7 +55,7 @@ function resolveColor(color) {
   return { r: pixel[0], g: pixel[1], b: pixel[2], a: pixel[3] };
 }
 
-function rgbaToCss({ r, g, b, a }) {
+function rgbaToCss(r, g, b, a) {
   return `rgba(${r}, ${g}, ${b}, ${a / 255})`;
 }
 
@@ -157,12 +157,8 @@ class Corner {
     if (cornerDestination.x !== this.previousDestination.x || cornerDestination.y !== this.previousDestination.y) {
       // 瞬移时 delta 赋值完立刻被 reset() 归零，跳过省掉无用计算。
       if (!immediate) {
-        const delta = {
-          x: cornerDestination.x - this.currentPosition.x,
-          y: cornerDestination.y - this.currentPosition.y
-        };
-        this.animationX.position = delta.x;
-        this.animationY.position = delta.y;
+        this.animationX.position = cornerDestination.x - this.currentPosition.x;
+        this.animationY.position = cornerDestination.y - this.currentPosition.y;
       }
       this.previousDestination.x = cornerDestination.x;
       this.previousDestination.y = cornerDestination.y;
@@ -206,19 +202,23 @@ function createNeovideCursor(options) {
   let particlesColor = options?.color || cursorColor;
 
   if (particlesColor === "default") {
-    const color = getComputedStyle(document.querySelector("body>.monaco-workbench"))
-      .getPropertyValue("--vscode-editorCursor-background").trim();
+    // querySelector 可能因 VS Code 版本 DOM 结构变化返回 null，
+    // getComputedStyle(null) 会抛出 TypeError，必须判空。
+    const workbench = document.querySelector("body>.monaco-workbench");
+    const color = workbench
+      ? getComputedStyle(workbench).getPropertyValue("--vscode-editorCursor-background").trim()
+      : "";
     particlesColor = color || "#ffffffff";
   }
 
   const colorObj = resolveColor(particlesColor);
   const shadowColorObj = resolveColor(shadowColor);
   // 预算颜色的 CSS 字符串——drawCursorShape 每帧要用，避免重复拼接和 GC。
-  const colorCss = rgbaToCss(colorObj);
+  const colorCss = rgbaToCss(colorObj.r, colorObj.g, colorObj.b, colorObj.a);
   const transparentCss = "rgba(0, 0, 0, 0)";
   const opaqueBlackCss = "rgba(0, 0, 0, 1)";
   // shadowCss 依赖 shadowAlphaFactor，setShadowAlphaFactor 变化时重算。
-  let shadowCss = rgbaToCss(shadowColorObj);
+  let shadowCss = rgbaToCss(shadowColorObj.r, shadowColorObj.g, shadowColorObj.b, shadowColorObj.a);
   let cursorDimensions = { width: 8, height: 18 };
   let destination = { x: 0, y: 0 };
   let centerDestination = { x: 0, y: 0 };
@@ -265,7 +265,7 @@ function createNeovideCursor(options) {
     const sctx = sprite.getContext("2d");
     sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     // 在 sprite 中心画矩形，触发 shadow，再用 destination-out 擦掉本体，只留光晕。
-    sctx.shadowColor = rgbaToCss(shadowColorObj);
+    sctx.shadowColor = rgbaToCss(shadowColorObj.r, shadowColorObj.g, shadowColorObj.b, shadowColorObj.a);
     sctx.shadowBlur = shadowBlur;
     sctx.fillStyle = colorCss;
     sctx.fillRect(pad, pad, w, h);
@@ -375,12 +375,7 @@ function createNeovideCursor(options) {
     if (next === shadowAlphaFactor) return;
     shadowAlphaFactor = next;
     // 只在因子真的变化时重算 shadow CSS，避免每帧字符串拼接。
-    shadowCss = rgbaToCss({
-      r: shadowColorObj.r,
-      g: shadowColorObj.g,
-      b: shadowColorObj.b,
-      a: shadowColorObj.a * shadowAlphaFactor
-    });
+    shadowCss = rgbaToCss(shadowColorObj.r, shadowColorObj.g, shadowColorObj.b, shadowColorObj.a * shadowAlphaFactor);
   }
 
   // 返回当前几何中心到最新目标（centerDestination）的距离。dying 光标用它
@@ -977,19 +972,7 @@ class GlobalCursorManager {
     if (!data.dirty && !this.isScrolling) {
       if (data.hidden) return false;
       const flying = instance.getDistanceToDestination() > CLIP_DISTANCE_THRESHOLD;
-      // shadow 外扩用 shadowBlur*2：canvas 高斯模糊的实际影响范围远大于
-      // shadowBlur（后者只是"模糊半径"，尾部像素能延伸到 ~2 倍处），与
-      // rebuildShadowSprite 里的 pad 保持一致。用 shadowBlur 会低估，光标离
-      // sticky/breadcrumb/邻居窗格 20~40px 时相交剪枝误判为不相交，shadow
-      // 就溢出到本该被 clip 挖掉的区域。
-      const shadowPad = shadowBlur * 2;
-      const bbox = {
-        left: data.lastX - shadowPad,
-        top: data.lastY - shadowPad,
-        right: data.lastX + data.lastWidth + shadowPad,
-        bottom: data.lastY + data.lastHeight + shadowPad,
-      };
-      return this.runWithEditorClip(data.editor, flying, bbox, () =>
+      return this.runWithEditorClip(data.editor, flying, this._makeBbox(data), () =>
         instance.updateLoopLogic(this.isScrolling, true)
       );
     }
@@ -1042,19 +1025,23 @@ class GlobalCursorManager {
     // 邻居窗格的内容里；飞行途中（跨窗格切换的动画中段）临时放开 clip，让
     // 光标可以穿越其他窗格，否则动画会被邻居窗格咬掉一段看起来断开了。
     const flying = instance.getDistanceToDestination() > CLIP_DISTANCE_THRESHOLD;
-    // 计算光标 + shadow 的外扩 bbox（CSS 像素），供 runWithEditorClip 做相交
-    // 剪枝：不与任何需挖矩形相交时可以完全跳过 save/rect/clip/restore。
-    // shadowPad 与 rebuildShadowSprite 保持一致，见上方快路径注释。
-    const shadowPad = shadowBlur * 2;
-    const bbox = {
-      left: data.lastX - shadowPad,
-      top: data.lastY - shadowPad,
-      right: data.lastX + data.lastWidth + shadowPad,
-      bottom: data.lastY + data.lastHeight + shadowPad,
-    };
-    return this.runWithEditorClip(data.editor, flying, bbox, () =>
+    return this.runWithEditorClip(data.editor, flying, this._makeBbox(data), () =>
       instance.updateLoopLogic(this.isScrolling, !isOffScreen)
     );
+  }
+
+  // 计算光标 + shadow 的外扩 bbox（CSS 像素），供 runWithEditorClip 做相交
+  // 剪枝：不与任何需挖矩形相交时可以完全跳过 save/rect/clip/restore。
+  // shadowPad 与 rebuildShadowSprite 保持一致（shadowBlur*2：canvas 高斯模糊
+  // 的实际影响范围远大于 shadowBlur，尾部像素能延伸到 ~2 倍处）。
+  _makeBbox(data) {
+    const pad = shadowBlur * 2;
+    return {
+      left: data.lastX - pad,
+      top: data.lastY - pad,
+      right: data.lastX + data.lastWidth + pad,
+      bottom: data.lastY + data.lastHeight + pad,
+    };
   }
 
   // 允许 dying / 跨窗格切换过程中的光标穿越 tab bar 和窗格之间的间隙，但不
