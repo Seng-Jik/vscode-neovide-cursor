@@ -209,12 +209,16 @@ function createNeovideCursor(options) {
   }
 
   const colorObj = resolveColor(particlesColor);
+  const shadowColorObj = resolveColor(shadowColor);
   let cursorDimensions = { width: 8, height: 18 };
   let destination = { x: 0, y: 0 };
   let centerDestination = { x: 0, y: 0 };
   let lastTimestamp = performance.now();
   let initialized = false;
   let jumped = false;
+  // 独立于 globalAlpha 的阴影强度系数：dying 光标越靠近吸附目标时，两个光标
+  // 的阴影会强烈重叠形成大面积光晕，需要按距离单独把阴影压下来。
+  let shadowAlphaFactor = 1;
 
   const corners = STANDARD_CORNERS.map(rel => new Corner(rel));
 
@@ -253,11 +257,40 @@ function createNeovideCursor(options) {
     context.fillStyle = rgbaToCss(colorObj);
     context.imageSmoothingEnabled = ANIMATION_SETTINGS.antialiasing;
 
-    if (useShadow) {
-      context.shadowColor = shadowColor;
+    // canvas 的阴影强度由 shadowColor 的 alpha 直接控制；shadowAlphaFactor 让
+    // 调用方能独立压制光晕（例如 dying 光标靠近吸附目标时避免叠出大面积光晕），
+    // 又不影响本体填充的透明度。
+    if (useShadow && shadowAlphaFactor > 0) {
+      context.shadowColor = rgbaToCss({
+        r: shadowColorObj.r,
+        g: shadowColorObj.g,
+        b: shadowColorObj.b,
+        a: shadowColorObj.a * shadowAlphaFactor
+      });
       context.shadowBlur = shadowBlur;
+    } else {
+      context.shadowColor = "rgba(0, 0, 0, 0)";
+      context.shadowBlur = 0;
     }
     context.fill();
+  }
+
+  function setShadowAlphaFactor(factor) {
+    shadowAlphaFactor = clamp(factor, 0, 1);
+  }
+
+  // 返回当前几何中心到最新目标（centerDestination）的距离。dying 光标用它
+  // 判断"离主光标还有多远"，从而快速拉低光晕 alpha。
+  function getDistanceToDestination() {
+    if (!initialized) return 0;
+    let cx = 0, cy = 0;
+    for (const corner of corners) {
+      cx += corner.currentPosition.x;
+      cy += corner.currentPosition.y;
+    }
+    cx /= corners.length;
+    cy /= corners.length;
+    return Math.hypot(centerDestination.x - cx, centerDestination.y - cy);
   }
 
   function setPosition(x, y) {
@@ -309,7 +342,7 @@ function createNeovideCursor(options) {
     return animating;
   }
 
-  return { move, updateCursorSize, setPosition, updateLoopLogic };
+  return { move, updateCursorSize, setPosition, updateLoopLogic, setShadowAlphaFactor, getDistanceToDestination };
 }
 
 class GlobalCursorManager {
@@ -535,6 +568,9 @@ class GlobalCursorManager {
     // 再突然消失"的跳变。乘以 1000 换成毫秒；下限 60ms 防止极短动画下淡出
     // 过快看起来像闪断。
     data.fadeDuration = Math.max(ANIMATION_SETTINGS.animationLength * 1000, 60);
+    // 记录起飞时刻到吸附目标的直线距离，作为归一化基准：越接近目标，光晕越
+    // 容易叠出大面积高亮，需要更快地把 shadow alpha 拉低。
+    data.suckStartDistance = Math.hypot(suckTarget.x - data.lastX, suckTarget.y - data.lastY);
     data.instance.move(suckTarget.x, suckTarget.y);
   }
 
@@ -559,16 +595,26 @@ class GlobalCursorManager {
     for (const [id, data] of this.cursors) {
       if (data.dying) {
         // dying 光标不再读 DOM（target 可能已经断链），只让 spring 动画跑完，
-        // 到达吸附点后再真正从 Map 里删掉。淡出用 globalAlpha 统一削弱本体和
-        // 阴影，避免多个光标叠加时产生大面积光晕。
+        // 到达吸附点后再真正从 Map 里删掉。
+        // 本体 alpha 用时间线性淡出；阴影 alpha 单独按"离目标的距离比"高次幂
+        // 快速衰减：光晕的成因是两个光标的阴影 blur 相互叠加，距离越近叠加
+        // 越强，若沿用时间线性会在收尾阶段看到明显光斑。
         const elapsed = performance.now() - data.dyingAt;
-        const alpha = Math.max(0, 1 - elapsed / data.fadeDuration);
-        if (alpha <= 0) {
+        const bodyAlpha = Math.max(0, 1 - elapsed / data.fadeDuration);
+        if (bodyAlpha <= 0) {
           this.cursors.delete(id);
           continue;
         }
+        const dist = data.instance.getDistanceToDestination();
+        const distRatio = data.suckStartDistance > 0
+          ? clamp(dist / data.suckStartDistance, 0, 1)
+          : 0;
+        // 三次方让阴影在"接近目标"的最后一段迅速掉到接近 0：距离剩 50% 时
+        // shadow 只有 12.5%，距离剩 20% 时只有 0.8%。
+        const shadowAlpha = distRatio * distRatio * distRatio;
+        data.instance.setShadowAlphaFactor(shadowAlpha);
         this.ctx.save();
-        this.ctx.globalAlpha = alpha;
+        this.ctx.globalAlpha = bodyAlpha;
         const animating = this.runWithEditorClip(data.editor, () =>
           data.instance.updateLoopLogic(this.isScrolling, true)
         );
